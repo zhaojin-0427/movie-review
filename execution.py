@@ -24,6 +24,7 @@ LEASE_SECONDS = 90
 ONLINE_SECONDS = 100
 LOCAL_REVIEW = 'node_local_v1'
 REVIEW_STORAGE_HEADER = 'X-Film-Worker-Review-Storage'
+REVIEW_MODES = {'central': '集中存储', LOCAL_REVIEW: '同机审片'}
 EXPORT_QUALITIES = {'1080p': '1080p', '4k': '4K'}
 KINDS = {'prepare': '首版', 'revise': '返修', 'finalize': '出片'}
 ROLE_TYPES = {'source_timeline': 'application/json', 'scene_bundle': 'application/zip',
@@ -62,6 +63,13 @@ def uint(value, minimum=0, maximum=2**53 - 1):
 
 def bounded(value, limit):
     return isinstance(value, str) and 0 < len(value.strip()) <= limit and len(value) <= limit
+
+
+def review_mode_editable(work):
+    return (work['kind'] == 'prepare' and work['target'] == 1
+            and work['state'] in ('queued', 'paused') and work['deleted_at'] is None
+            and work['node'] is None and work['lease'] is None and work['receipt'] is None
+            and work['control'] != 'withdrawn' and not work['review_exists'])
 
 
 def export_size(native, quality):
@@ -896,7 +904,8 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                             e.local_review,e.review_instance,b.name AS review_device,
                             coalesce(b.deleted_at IS NULL AND b.seen>? AND b.instance=e.review_instance
                                 AND json_extract(b.capabilities,'$.review_storage')=?,0) AS review_online,
-                            json_extract(w.manifest,'$.export_quality') AS export_quality,
+                            CASE WHEN w.kind='finalize' THEN json_extract(w.manifest,'$.export_quality')
+                                 ELSE e.export_quality END AS export_quality,
                             EXISTS(SELECT 1 FROM execution_deliveries d WHERE d.job=w.job AND d.version=w.target) AS delivered,
                             EXISTS(SELECT 1 FROM versions v WHERE v.job_id=w.job) AS review_exists
                             FROM execution_work w JOIN jobs j ON j.id=w.job LEFT JOIN execution_nodes n ON n.id=w.node
@@ -911,8 +920,13 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                 JOIN execution_nodes n ON n.id=a.node LEFT JOIN users u ON u.id=a.returned_by
                 WHERE a.work IN ({ids}) ORDER BY a.attempt DESC''', tuple(attempts)):
                 attempts[row['work']].append(row)
+        running = {node['id']: [] for node in nodes}
+        for row in conn.execute("SELECT node,job,kind,target FROM execution_work WHERE state='leased' ORDER BY job"):
+            if row['node'] in running:
+                running[row['node']].append(row)
         return render_template('execution.html', nodes=nodes, tokens=history, work=work, attempts=attempts,
-                               kinds=KINDS, secret=secret, issued_node=issued_node, stamp=stamp,
+                               running=running, kinds=KINDS, secret=secret, issued_node=issued_node, stamp=stamp,
+                               review_modes=REVIEW_MODES, local_review_mode=LOCAL_REVIEW, review_mode_editable=review_mode_editable,
                                register_request=secrets.token_hex(16), issue_request=secrets.token_hex(16))
 
     @admin.get('/admin/execution')
@@ -1091,7 +1105,7 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
     def create_job():
         quality = request.form.get('export_quality', '1080p')
         review_mode = request.form.get('review_mode', 'central')
-        if quality not in EXPORT_QUALITIES or review_mode not in ('central', LOCAL_REVIEW):
+        if quality not in EXPORT_QUALITIES or review_mode not in REVIEW_MODES:
             abort(422, '成片质量或审片存储模式无效')
         with tempfile.TemporaryDirectory(dir=parts_dir) as folder:
             staged = stage_files(folder, 'source', VIDEO_TYPES)
@@ -1132,6 +1146,37 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
         flash('，'.join(messages) + '，等待空闲设备领取。' if created else '所选视频均已上传过，未创建新工单。',
               'success' if created else 'info')
         return redirect(url_for('execution.panel', _anchor='queue'), code=303)
+
+    @admin.post('/admin/execution/jobs/<int:job>/review-mode')
+    @requires('admin')
+    def set_review_mode(job):
+        mode = request.form.get('review_mode')
+        if mode not in REVIEW_MODES:
+            abort(422, '请选择集中存储或同机审片')
+        with write() as conn:
+            assert_session('admin')
+            work = conn.execute("""SELECT w.*,e.local_review,c.state AS control,
+                                       EXISTS(SELECT 1 FROM versions v WHERE v.job_id=w.job) AS review_exists
+                                   FROM execution_work w JOIN execution_jobs e ON e.job=w.job
+                                   LEFT JOIN job_controls c ON c.job_id=w.job
+                                   WHERE w.job=? AND w.kind='prepare' AND w.target=1""", (job,)).fetchone()
+            if not work or work['deleted_at'] is not None:
+                abort(404, '首版工单不存在')
+            if not review_mode_editable(work):
+                abort(409, '审片存储只可在首版待领取或已暂停、没有租约且审核版尚未入库时修改')
+            local = mode == LOCAL_REVIEW
+            if local != work['local_review']:
+                previous = LOCAL_REVIEW if work['local_review'] else 'central'
+                conn.execute('UPDATE execution_jobs SET local_review=?,review_node=NULL,review_instance=NULL WHERE job=?',
+                             (local,job))
+                manifest = json.loads(work['manifest'])
+                if manifest.pop('review_storage', None) is not None:
+                    conn.execute('UPDATE execution_work SET manifest=?,manifest_hash=? WHERE id=?',
+                                 (json_text(manifest),object_hash(manifest),work['id']))
+                conn.execute('INSERT INTO execution_management_events VALUES(?,?,?,?,?)',
+                             (job,g.user['id'],'review_mode',f'{REVIEW_MODES[previous]} → {REVIEW_MODES[mode]}',now()))
+        flash(f'审片存储已保存为「{REVIEW_MODES[mode]}」。', 'success')
+        return redirect(url_for('execution.panel', _anchor=work['id']), code=303)
 
     @admin.post('/admin/execution/jobs/<int:job>/export-quality')
     @requires('admin')

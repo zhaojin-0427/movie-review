@@ -419,6 +419,48 @@ const sectionNav = find('[data-section-nav]');
 if (sectionNav) {
   const panels = [...document.querySelectorAll('[data-execution-section]')];
   const links = [...sectionNav.querySelectorAll('a')];
+  const dialogs = [...document.querySelectorAll('.execution-dialog')];
+  function selectDetailTab(dialog, selected) {
+    for (const tab of dialog.querySelectorAll('[role="tab"]')) {
+      const active = tab === selected;
+      tab.setAttribute('aria-selected', String(active));
+      tab.tabIndex = active ? 0 : -1;
+      document.getElementById(tab.getAttribute('aria-controls')).hidden = !active;
+    }
+  }
+  function openExecutionDialog(dialog) {
+    if (dialog.open) return;
+    selectDetailTab(dialog, dialog.querySelector('[role="tab"]'));
+    dialog.showModal();
+  }
+  for (const dialog of dialogs) {
+    const section = dialog.closest('[data-execution-section]');
+    const opener = dialog.previousElementSibling;
+    opener.addEventListener('click', () => openExecutionDialog(dialog));
+    for (const button of dialog.querySelectorAll('[data-close-execution-dialog]')) {
+      button.addEventListener('click', () => dialog.close());
+    }
+    dialog.addEventListener('close', () => {
+      if (location.hash === '#' + dialog.id) history.replaceState(null, '', '#' + section.id);
+      opener.focus({preventScroll: true});
+    });
+    const tabs = [...dialog.querySelectorAll('[role="tab"]')];
+    for (const [index, tab] of tabs.entries()) {
+      tab.addEventListener('click', () => selectDetailTab(dialog, tab));
+      tab.addEventListener('keydown', event => {
+        const next = {
+          ArrowLeft: (index - 1 + tabs.length) % tabs.length,
+          ArrowRight: (index + 1) % tabs.length,
+          Home: 0,
+          End: tabs.length - 1,
+        }[event.key];
+        if (next === undefined) return;
+        event.preventDefault();
+        selectDetailTab(dialog, tabs[next]);
+        tabs[next].focus();
+      });
+    }
+  }
   const showSection = () => {
     const target = document.getElementById(location.hash.slice(1));
     const section = target?.closest('[data-execution-section]') || panels[0];
@@ -427,9 +469,14 @@ if (sectionNav) {
       if (link.hash === `#${section.id}`) link.setAttribute('aria-current', 'location');
       else link.removeAttribute('aria-current');
     }
-    if (target instanceof HTMLDetailsElement) {
-      target.open = true;
-      target.scrollIntoView({block: 'nearest'});
+    if (dialogs.includes(target)) {
+      const notice = find('.execution-page > .notice[role="status"]');
+      if (notice) {
+        target.querySelector('[data-execution-dialog-notice]').replaceChildren(notice.cloneNode(true));
+        notice.remove();
+      }
+      target.closest('[data-list-item]').scrollIntoView({block: 'nearest'});
+      openExecutionDialog(target);
     } else if (target && sectionNav.getBoundingClientRect().top < 92) {
       sectionNav.scrollIntoView({block: 'start'});
     }

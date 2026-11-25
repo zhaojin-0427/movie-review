@@ -2,6 +2,25 @@
 {% block title %}执行管理 · 镜头审核{% endblock %}
 {% block main_class %}page execution-page{% endblock %}
 {% block content %}
+{% macro detail_header(id, title, subtitle, status, badge) %}
+  <header class="execution-dialog-header">
+    <div><p class="field-help">{{ subtitle }}</p><h2 id="{{ id }}-title">{{ title }}</h2></div>
+    <div class="execution-actions"><span class="badge {{ badge }}">{{ status }}</span>
+      <button type="button" class="button small execution-dialog-close" data-close-execution-dialog aria-label="关闭弹窗">×</button>
+    </div>
+  </header>
+{% endmacro %}
+{% macro detail_tabs(id, label, tabs) %}
+  <div class="execution-dialog-tabs" role="tablist" aria-label="{{ label }}">
+    {% for key, name in tabs %}<button type="button" role="tab" id="{{ id }}-tab-{{ key }}"
+      aria-controls="{{ id }}-{{ key }}" aria-selected="{{ 'true' if loop.first else 'false' }}"{% if not loop.first %} tabindex="-1"{% endif %}>{{ name }}</button>{% endfor %}
+  </div>
+{% endmacro %}
+{% macro detail_footer() %}
+  <footer class="execution-dialog-footer"><div data-execution-dialog-notice></div>
+    <button type="button" class="button small" data-close-execution-dialog>关闭</button>
+  </footer>
+{% endmacro %}
 <header class="page-heading">
   <div><h1>执行管理</h1><p>查看设备运行状态，管理接入密钥和制作工单。</p></div>
 </header>
@@ -23,7 +42,7 @@
 {% endif %}
 
 <div class="execution-grid execution-section" id="devices" data-execution-section>
-  <section class="panel execution-list" aria-labelledby="devices-title" data-filter-list>
+  <section class="panel execution-list execution-card-list" aria-labelledby="devices-title" data-filter-list>
     <header class="section-heading section-heading-panel">
       <div><h2 id="devices-title">执行设备</h2><p>查看在线状态、槽位、磁盘和当前实例绑定。</p></div>
       <span class="total"><span data-match-count>{{ nodes|length }}</span> 台</span>
@@ -35,27 +54,35 @@
       <label>实例绑定<select data-filter="binding"><option value="">全部设备</option><option value="bound">已绑定</option><option value="unbound">未绑定</option></select></label>
     </div>{% endif %}
     {% for node in nodes %}
-    <article class="execution-item execution-item-compact" data-list-item data-search="{{ node.name }} {{ node.id }}" data-status="{{ 'online' if node.online else ('offline' if node.seen else 'pending') }}" data-binding="{{ 'bound' if node.bound_instance else 'unbound' }}">
-      <div class="execution-item-head">
-        <div><strong>{{ node.name }}</strong><small class="mono">{{ node.id }}</small></div>
-        <span class="badge {{ 'approved' if node.online else 'paused' }}">{{ '在线' if node.online else ('离线' if node.seen else '待注册') }}</span>
+    {% set status = '在线' if node.online else ('离线' if node.seen else '待注册') %}
+    {% set badge = 'approved' if node.online else 'paused' %}
+    <article class="execution-item execution-card" data-list-item data-search="{{ node.name }} {{ node.id }}" data-status="{{ 'online' if node.online else ('offline' if node.seen else 'pending') }}" data-binding="{{ 'bound' if node.bound_instance else 'unbound' }}">
+      <div class="execution-card-name"><strong>{{ node.name }}</strong>
+        <small>{{ node.cap.environment.os or '未上报系统' if node.cap else '等待注册' }}{% if node.cap and node.cap.environment.render_backend %} · {{ node.cap.environment.render_backend }}{% endif %}</small>
       </div>
-      <p class="execution-note execution-status-note execution-compact-note">
-        <span>{{ node.active }} / {{ node.cap.slots if node.cap else '—' }} 个槽位执行中</span>
-        <span>{{ node.active_key_count }} 枚有效密钥</span>
-        {% if node.draining %}<span class="status-warning">管理员已暂停领单</span>{% elif node.disk_free is not none and node.disk_free < node.disk_reserve %}<span class="status-warning">磁盘不足，暂停领单</span>{% endif %}
-        {% if node.failure %}<span>最近失败 {{ node.failure }}</span>{% endif %}
-      </p>
-      <details class="execution-details execution-device-details">
-        <summary><span>查看设备详情</span><small>环境、磁盘、实例绑定、能力与设备操作</small></summary>
-        <div class="execution-detail-body">
+      <div class="execution-card-status">
+        <span class="badge {{ badge }}">{{ status }}</span>
+        <small>{{ node.active }} / {{ node.cap.slots if node.cap else '—' }} 个槽位使用中</small>
+        {% if node.draining %}<small class="status-warning">已暂停领单</small>{% elif node.disk_free is not none and node.disk_free < node.disk_reserve %}<small class="status-warning">磁盘不足，暂停领单</small>{% endif %}
+      </div>
+      <button type="button" class="button small execution-card-open" data-open-execution-dialog="{{ node.id }}" aria-haspopup="dialog" aria-controls="{{ node.id }}" aria-label="查看设备详情 {{ node.name }}">查看详情 <span aria-hidden="true">›</span></button>
+      <dialog class="execution-dialog execution-device-details" id="{{ node.id }}" aria-labelledby="{{ node.id }}-title">
+        {{ detail_header(node.id, node.name, '设备详情', status, badge) }}
+        {{ detail_tabs(node.id, '设备详情', [('overview','概览'),('instance','实例与能力'),('actions','设备操作')]) }}
+        <section class="execution-dialog-body" role="tabpanel" id="{{ node.id }}-overview" aria-labelledby="{{ node.id }}-tab-overview" tabindex="0">
           <dl class="execution-facts">
-            <div><dt>设备环境</dt><dd>{{ node.cap.environment.os if node.cap else '—' }}{% if node.cap and node.cap.environment.render_backend %} · {{ node.cap.environment.render_backend }}{% endif %}</dd></div>
+            <div><dt>设备环境</dt><dd>{{ node.cap.environment.os or '未上报' if node.cap else '—' }}</dd></div>
             <div><dt>执行中 / 总槽位</dt><dd>{{ node.active }} / {{ node.cap.slots if node.cap else '—' }}</dd></div>
+            <div><dt>最近心跳</dt><dd>{% if node.last_seen %}<time datetime="{{ node.last_seen }}" data-local-time>{{ node.last_seen }}</time>{% else %}—{% endif %}</dd></div>
             <div><dt>可用磁盘</dt><dd>{{ '%.1f GiB'|format(node.disk_free / 1073741824) if node.disk_free is not none else '未上报' }}</dd></div>
             <div><dt>预留磁盘</dt><dd>{{ '%.1f GiB'|format(node.disk_reserve / 1073741824) if node.disk_reserve is not none else '未上报' }}</dd></div>
-            <div><dt>最近心跳</dt><dd>{% if node.last_seen %}<time datetime="{{ node.last_seen }}" data-local-time>{{ node.last_seen }}</time>{% else %}—{% endif %}</dd></div>
+            <div><dt>有效密钥</dt><dd>{{ node.active_key_count }} 枚</dd></div>
+            <div><dt>当前工单</dt><dd>{% for item in running[node.id] %}<span class="execution-running-job">#{{ item.job }} · {{ kinds[item.kind] }} V{{ item.target }}</span>{% else %}—{% endfor %}</dd></div>
+            {% if node.failure %}<div><dt>最近失败</dt><dd>{{ node.failure }}</dd></div>{% endif %}
           </dl>
+        </section>
+        <section class="execution-dialog-body" role="tabpanel" id="{{ node.id }}-instance" aria-labelledby="{{ node.id }}-tab-instance" tabindex="0" hidden>
+          <p class="execution-note">节点标识 <span class="mono">{{ node.id }}</span></p>
           <div class="device-binding {{ 'is-bound' if node.bound_instance else 'is-pending' }}">
             <div><span class="eyebrow">实例绑定</span><strong>{{ node.binding_state }}</strong>
             {% if node.bound_instance %}<small>实例 <span class="mono">{{ node.bound_instance }}</span>{% if node.bound_by_name %} · {{ node.bound_by_name }}{% endif %}</small>
@@ -69,8 +96,15 @@
           </div>
           {% if node.cap %}<div class="execution-capability">
             <div class="execution-detail-label">设备能力</div>
-            <div class="execution-note">{{ node.cap.work_kinds|map('string')|join(' / ') }} · 最大宽度 {{ node.cap.max_frame_width }} px · 渲染后端 {{ node.cap.render_backends|join(' / ') }}</div>
+            <dl class="execution-facts">
+              <div><dt>工单类型</dt><dd>{% for kind in node.cap.work_kinds %}{{ kinds.get(kind, kind) }}{% if not loop.last %} / {% endif %}{% endfor %}</dd></div>
+              <div><dt>渲染后端</dt><dd>{{ node.cap.render_backends|join(' / ') }}</dd></div>
+              <div><dt>最大宽度</dt><dd>{{ node.cap.max_frame_width }} px</dd></div>
+              <div><dt>同机审片</dt><dd>{{ '支持' if node.cap.review_storage == local_review_mode else '未声明' }}</dd></div>
+            </dl>
           </div>{% endif %}
+        </section>
+        <section class="execution-dialog-body" role="tabpanel" id="{{ node.id }}-actions" aria-labelledby="{{ node.id }}-tab-actions" tabindex="0" hidden>
           <div class="execution-actions execution-item-actions">
             <form method="post" action="{{ url_for('execution.device_control',node=node.id) }}">
               <input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="button small" name="action" value="{{ 'resume' if node.draining else 'drain' }}">{{ '恢复领单' if node.draining else '暂停领单' }}</button>
@@ -80,8 +114,9 @@
               <input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="button small outline-danger">删除设备</button>
             </form>{% endif %}
           </div>
-        </div>
-      </details>
+        </section>
+        {{ detail_footer() }}
+      </dialog>
     </article>
     {% else %}<p class="execution-empty">暂无设备。登记后，将节点标识和密钥填入执行端。</p>{% endfor %}
     <p class="execution-empty" data-no-matches hidden>没有符合条件的设备。</p>
@@ -140,7 +175,7 @@
 </section>
 
 <div class="execution-grid execution-section" id="queue" data-execution-section>
-  <section class="panel execution-list" aria-labelledby="queue-title" data-filter-list>
+  <section class="panel execution-list execution-card-list" aria-labelledby="queue-title" data-filter-list>
     <header class="section-heading section-heading-panel">
       <div><h2 id="queue-title">工单</h2><p>空闲设备自动领单。已领取的工单由管理员退回后重新排队。</p></div>
       <span class="total">最近 <span data-match-count>{{ work|length }}</span> 张</span>
@@ -152,25 +187,71 @@
       <label>工单类型<select data-filter="kind"><option value="">全部类型</option>{% for key, label in kinds.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></label>
       <p class="field-help">在最近 100 张工单中筛选。</p>
     </div>{% endif %}
-    {% for item in work %}<article class="execution-item execution-item-compact" data-list-item data-search="{{ item.title }} #{{ item.job }}" data-status="{{ item.state }}" data-kind="{{ item.kind }}">
-      <div class="execution-item-head"><div><strong>{{ item.title }}</strong><small>#{{ item.job }} · {{ kinds[item.kind] }} V{{ item.target }}</small></div><span class="badge {{ 'approved' if item.state == 'succeeded' else ('paused' if item.state in ('failed','paused','stopped') else 'waiting') }}">{{ states[item.state] }}</span></div>
-      <p class="execution-note execution-work-summary">{% if item.device %}{{ item.device }} · 第 {{ item.attempt }} 次领取{% elif item.state == 'queued' %}等待设备领取{% else %}暂无领取设备{% endif %}{% if item.stage %} · {{ item.stage }}{% endif %}{% if item.total %} · {{ item.completed }}/{{ item.total }}{% endif %}{% if item.failure %} · {{ {'lease_expired':'设备续租超时','credential_inactive':'设备密钥失效','job_paused':'执行期间暂停','awaiting_return':'等待管理员退回','render_failed':'制作失败','profile_mismatch':'设备配置不匹配'}.get(item.failure,item.failure) }}{% endif %}</p>
-      <div class="execution-actions execution-primary-actions">
-        {% if item.local_review %}<span class="field-help">同机审片 · {% if item.review_instance %}{{ item.review_device }}{% if item.state == 'queued' and not item.review_online %} · 等待原实例上线{% endif %}{% else %}等待支持同机审片的设备{% endif %}</span>{% endif %}
-        {% if item.export_quality %}<span class="field-help">{{ '4K' if item.export_quality == '4k' else '1080p' }}</span>{% endif %}
-        {% if item.review_exists %}<a class="button small" href="{{ url_for('review',job_id=item.job) }}">审核详情</a>{% endif %}
-        {% if item.delivered and item.kind == 'finalize' %}<a class="button small" href="{{ url_for('execution.delivery',job=item.job,version=item.target,role='delivery_bundle') }}">下载交付包</a><a class="button small" href="{{ url_for('execution.delivery',job=item.job,version=item.target,role='white_video') }}">白模视频</a><a class="button small" href="{{ url_for('execution.delivery',job=item.job,version=item.target,role='comparison_video') }}">对比视频</a>{% endif %}
+    {% for item in work %}
+    {% set review_mode = local_review_mode if item.local_review else 'central' %}
+    {% set badge = 'approved' if item.state == 'succeeded' else ('review' if item.state == 'leased' else 'paused' if item.state in ('failed','paused','stopped') else 'waiting') %}
+    {% set subtitle = '#' ~ item.job ~ ' · ' ~ kinds[item.kind] ~ ' V' ~ item.target %}
+    <article class="execution-item execution-card" data-list-item data-search="{{ item.title }} #{{ item.job }}" data-status="{{ item.state }}" data-kind="{{ item.kind }}">
+      <div class="execution-card-name"><strong>{{ item.title }}</strong><small>{{ subtitle }}</small></div>
+      <div class="execution-card-status">
+        <span class="badge {{ badge }}">{{ states[item.state] }}</span>
+        <small>{{ review_modes[review_mode] }}{% if item.device and item.state == 'leased' %} · {{ item.device }}{% endif %}</small>
       </div>
-      <details class="execution-details execution-work-details">
-        <summary><span>查看工单详情</span><small>{% if attempts[item.id] %}领取记录 {{ attempts[item.id]|length }} 条 · {% endif %}工单操作</small></summary>
-        <div class="execution-detail-body">
-          {% if attempts[item.id] %}<section class="execution-detail-section">
-            <h3>领取记录（{{ attempts[item.id]|length }}）</h3>
-            <ul>{% for claim in attempts[item.id] %}<li>第 {{ claim.attempt }} 次 · {{ claim.device }}{% if claim.claimed_at is not none %} · <time datetime="{{ stamp(claim.claimed_at) }}" data-local-time>{{ stamp(claim.claimed_at) }}</time>{% endif %}
-              {% if claim.returned_at is not none %}<br>退回 · {{ claim.returned_by_name }} · <time datetime="{{ stamp(claim.returned_at) }}" data-local-time>{{ stamp(claim.returned_at) }}</time> · {{ claim.return_reason }}{% endif %}</li>{% endfor %}</ul>
-          </section>{% endif %}
-          <section class="execution-detail-section">
-            <h3>工单操作</h3>
+      <button type="button" class="button small execution-card-open" data-open-execution-dialog="{{ item.id }}" aria-haspopup="dialog" aria-controls="{{ item.id }}" aria-label="查看工单详情 {{ subtitle }}">查看详情 <span aria-hidden="true">›</span></button>
+      <dialog class="execution-dialog execution-work-details" id="{{ item.id }}" aria-labelledby="{{ item.id }}-title">
+        {{ detail_header(item.id, item.title, '工单 ' ~ subtitle, states[item.state], badge) }}
+        {{ detail_tabs(item.id, '工单详情', [('overview','概览'),('history','领取记录（' ~ attempts[item.id]|length ~ '）'),('actions','工单操作')]) }}
+        <section class="execution-dialog-body" role="tabpanel" id="{{ item.id }}-overview" aria-labelledby="{{ item.id }}-tab-overview" tabindex="0">
+          <dl class="execution-facts">
+            <div><dt>当前阶段</dt><dd>{{ item.stage or ('等待设备领取' if item.state == 'queued' else states[item.state]) }}{% if item.total %} · {{ item.completed }}/{{ item.total }}{% endif %}</dd></div>
+            <div><dt>执行设备</dt><dd>{{ item.device or '—' }}</dd></div>
+            <div><dt>成片画质</dt><dd>{{ {'4k':'4K','1080p':'1080p'}.get(item.export_quality, '原生画幅') }}</dd></div>
+          </dl>
+          {% if item.failure %}<p class="execution-note">最近失败 · {{ {'lease_expired':'设备续租超时','credential_inactive':'设备密钥失效','job_paused':'执行期间暂停','awaiting_return':'等待管理员退回','render_failed':'制作失败','profile_mismatch':'设备配置不匹配'}.get(item.failure,item.failure) }}</p>{% endif %}
+          <div class="execution-dialog-box">
+            <h3>审片存储</h3>
+            {% if review_mode_editable(item) %}
+            <p class="execution-note">更改后从下一次领取生效。</p>
+            <form class="execution-actions execution-mode-form" method="post" action="{{ url_for('execution.set_review_mode', job=item.job) }}">
+              <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+              <select name="review_mode" aria-label="审片存储">
+                {% for key, label in review_modes.items() %}<option value="{{ key }}"{% if key == review_mode %} selected{% endif %}>{{ label }}</option>{% endfor %}
+              </select>
+              <button class="button small primary" type="submit">保存存储模式</button>
+            </form>
+            {% else %}
+            <p class="execution-note">{{ review_modes[review_mode] }} · 已锁定</p>
+            {% if item.review_exists %}<p class="field-help">审核版本已入库。</p>
+            {% elif item.state in ('leased', 'failed') %}<p class="field-help">退回待领后可切换存储模式。</p>{% endif %}
+            {% endif %}
+            {% if item.local_review %}
+            <p class="field-help">{% if item.review_instance %}绑定设备 · {{ item.review_device }}{% if item.state == 'queued' and not item.review_online %} · 等待原实例上线{% endif %}{% elif item.state == 'queued' %}等待支持同机审片的设备领取。{% endif %}</p>
+            {% endif %}
+          </div>
+          {% if item.review_exists or item.delivered %}
+          <div class="execution-actions execution-dialog-links">
+            {% if item.review_exists %}<a class="button small" href="{{ url_for('review',job_id=item.job) }}">审核详情</a>{% endif %}
+            {% if item.delivered and item.kind == 'finalize' %}<a class="button small" href="{{ url_for('execution.delivery',job=item.job,version=item.target,role='delivery_bundle') }}">下载交付包</a><a class="button small" href="{{ url_for('execution.delivery',job=item.job,version=item.target,role='white_video') }}">白模视频</a><a class="button small" href="{{ url_for('execution.delivery',job=item.job,version=item.target,role='comparison_video') }}">对比视频</a>{% endif %}
+          </div>{% endif %}
+        </section>
+        <section class="execution-dialog-body" role="tabpanel" id="{{ item.id }}-history" aria-labelledby="{{ item.id }}-tab-history" tabindex="0" hidden>
+          {% if attempts[item.id] %}<ol class="execution-claim-history">
+            {% for claim in attempts[item.id] %}
+            <li>
+              <div class="execution-claim-heading"><strong>第 {{ claim.attempt }} 次领取</strong>
+                {% if claim.returned_at is not none %}<span class="badge waiting">已退回</span>
+                {% elif claim.attempt == item.attempt and item.state != 'queued' %}<span class="badge {{ badge }}">{{ states[item.state] }}</span>{% endif %}
+              </div>
+              <div class="execution-claim-event"><span>领取</span><strong>{{ claim.device }}</strong>{% if claim.claimed_at is not none %}<time datetime="{{ stamp(claim.claimed_at) }}" data-local-time>{{ stamp(claim.claimed_at) }}</time>{% endif %}</div>
+              {% if claim.returned_at is not none %}
+              <div class="execution-claim-event"><span>退回</span><strong>{{ claim.returned_by_name or '—' }}</strong><time datetime="{{ stamp(claim.returned_at) }}" data-local-time>{{ stamp(claim.returned_at) }}</time></div>
+              {% if claim.return_reason %}<p class="execution-claim-reason">原因 · {{ claim.return_reason }}</p>{% endif %}
+              {% endif %}
+            </li>
+            {% endfor %}
+          </ol>{% else %}<p class="execution-note">暂无领取记录。</p>{% endif %}
+        </section>
+        <section class="execution-dialog-body" role="tabpanel" id="{{ item.id }}-actions" aria-labelledby="{{ item.id }}-tab-actions" tabindex="0" hidden>
             <div class="execution-action-layout{% if item.state in ('queued','leased','paused','failed') and item.control != 'withdrawn' %} has-control{% endif %}">
             {% if item.state in ('queued','leased','paused','failed') and item.control != 'withdrawn' %}
             <form method="post" action="{{ url_for('execution.control',job=item.job) }}" class="stack execution-control-form">
@@ -189,9 +270,9 @@
               <button class="button small outline-danger">删除工单</button>
             </form>{% endif %}
             </div>
-          </section>
-        </div>
-      </details>
+        </section>
+        {{ detail_footer() }}
+      </dialog>
     </article>
 {% else %}<p class="execution-empty">暂无制作工单。上传原片后，系统会生成首版工单。</p>{% endfor %}
     <p class="execution-empty" data-no-matches hidden>没有符合条件的工单。</p>
@@ -209,8 +290,7 @@
       <input class="visually-hidden" id="execution-source" type="file" name="source" accept=".mp4,.mov,.mkv,.webm,.m4v" multiple required>
       <div class="execution-upload-files" data-upload-files hidden></div>
       <label>审片存储<select name="review_mode">
-        <option value="central">集中存储</option>
-        <option value="node_local_v1">同机审片</option>
+        {% for key, label in review_modes.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}
       </select></label>
       <label>成片质量<select name="export_quality">
         <option value="1080p">1080p</option>

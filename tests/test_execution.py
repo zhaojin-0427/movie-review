@@ -128,13 +128,77 @@ class ExecutionTest(unittest.TestCase):
         self.assertIn('演练 Mac', page)
         self.assertIn('模拟影片', page)
         for detail_class in ('execution-device-details', 'execution-work-details'):
-            match = re.search(r'<details class="[^"]*' + detail_class + r'[^"]*">', page)
+            match = re.search(r'<dialog class="execution-dialog ' + detail_class + r'"[^>]*>', page)
             self.assertIsNotNone(match)
             self.assertNotIn(' open', match.group(0))
         self.assertIn('查看设备详情', page)
         self.assertIn('查看工单详情', page)
         self.assertIn('设备环境', page)
         self.assertIn('工单操作', page)
+
+    def test_admin_can_switch_review_mode_after_return_before_review(self):
+        self.setup_profile()
+        with closing(sqlite3.connect(self.root / 'review.sqlite3')) as conn:
+            job, work, manifest_hash = conn.execute('SELECT job,id,manifest_hash FROM execution_work').fetchone()
+        path = f'/admin/execution/jobs/{job}/review-mode'
+        page = self.admin.get('/admin/execution', base_url=BASE).text
+        self.assertIn(f'action="{path}"', page)
+        self.assertIn(f'<dialog class="execution-dialog execution-work-details" id="{work}"', page)
+        self.assertEqual(self.post(self.reviewer,path,review_mode=LOCAL_REVIEW).status_code,403)
+        self.assertEqual(self.admin.post(path,data={'review_mode':LOCAL_REVIEW},base_url=BASE).status_code,400)
+        self.assertEqual(self.post(self.admin,path,review_mode='invalid').status_code,422)
+
+        for mode in (LOCAL_REVIEW, 'central', LOCAL_REVIEW):
+            response = self.post(self.admin,path,review_mode=mode)
+            self.assertEqual(response.status_code,303)
+            self.assertEqual(response.headers['Location'],f'/admin/execution#{work}')
+            with closing(sqlite3.connect(self.root / 'review.sqlite3')) as conn:
+                self.assertEqual(conn.execute('SELECT local_review,review_instance FROM execution_jobs').fetchone(),
+                                 (mode == LOCAL_REVIEW,None))
+                self.assertEqual(conn.execute('SELECT manifest_hash,attempt FROM execution_work').fetchone(),
+                                 (manifest_hash,0))
+
+        self.register()
+        self.heartbeat()
+        self.claim('old-worker-cannot-claim',204)
+        self.register(key='local-worker',local=True)
+        self.heartbeat()
+        claimed = self.claim('first-claim')
+        self.assertEqual(claimed['input_manifest']['review_storage'],dict(mode=LOCAL_REVIEW,instance_id=self.instance))
+        self.assertEqual(object_hash(claimed['input_manifest']),claimed['input_manifest_sha256'])
+        self.assertEqual(self.post(self.admin,path,review_mode='central').status_code,409)
+        page = self.admin.get('/admin/execution', base_url=BASE).text
+        self.assertNotIn(f'action="{path}"',page)
+        self.assertIn('同机审片 · 已锁定',page)
+        self.return_work(claimed,'leased')
+        page = self.admin.get('/admin/execution', base_url=BASE).text
+        self.assertIn(f'action="{path}"',page)
+        self.assertIn('已退回',page)
+        self.assertEqual(self.post(self.admin,path,review_mode='central').status_code,303)
+        self.claim('first-claim',204)
+        with closing(sqlite3.connect(self.root / 'review.sqlite3')) as conn:
+            self.assertEqual(conn.execute('SELECT local_review,review_node,review_instance FROM execution_jobs').fetchone(),
+                             (0,None,None))
+            raw, digest = conn.execute('SELECT manifest,manifest_hash FROM execution_work').fetchone()
+            self.assertNotIn('review_storage',json.loads(raw))
+            self.assertEqual(object_hash(json.loads(raw)),digest)
+            self.assertEqual(conn.execute('SELECT returned_at IS NOT NULL FROM execution_attempts').fetchone(),(1,))
+        self.register(key='legacy-again')
+        self.heartbeat()
+        returned = self.claim('claim-after-return')
+        self.assertEqual(returned['lease']['attempt'],2)
+        self.assertEqual(returned['input_manifest_sha256'],manifest_hash)
+        self.return_work(returned,'leased')
+        self.assertEqual(self.post(self.admin,path,review_mode=LOCAL_REVIEW).status_code,303)
+        self.register(key='local-again',local=True)
+        self.heartbeat()
+        new_attempt = self.claim('local-after-return')
+        self.assertEqual(new_attempt['lease']['attempt'],3)
+        self.assertEqual(new_attempt['input_manifest']['review_storage'],dict(mode=LOCAL_REVIEW,instance_id=self.instance))
+        self.produce_review(new_attempt,1)
+        self.assertEqual(self.post(self.admin,path,review_mode='central').status_code,409)
+        with closing(sqlite3.connect(self.root / 'review.sqlite3')) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM execution_management_events WHERE action='review_mode'").fetchone(),(5,))
 
     def test_batch_job_uploads_create_individual_jobs_and_skip_duplicates(self):
         self.setup_profile()
