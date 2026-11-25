@@ -1,0 +1,40 @@
+{% extends 'base.html' %}
+{% block title %}导入送审 · 镜头审核{% endblock %}
+{% block main_class %}page import-page{% endblock %}
+{% block content %}
+<a class="back-link" href="{{ url_for('index') }}">← 审核队列</a>
+<header class="page-heading"><div><h1>导入送审</h1><p>上传包含逐帧上下对比图的 ZIP 压缩包。</p></div></header>
+<div class="import-layout">
+<section class="panel form-panel" aria-labelledby="upload-title">
+  <h2 id="upload-title">送审文件</h2>
+  {% if error %}<div class="notice error" role="alert">{{ error }}</div>{% endif %}
+  <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data" class="stack" id="upload-form">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <label>送审作业
+      <select name="job_id" id="import-job">
+        <option value="">创建新作业</option>
+        {% for job in jobs %}{% set key = job.id|string ~ ':' ~ job.number|string %}<option value="{{ key }}" {% if selected == key %}selected{% endif %}>{{ job.title }} · V{{ job.number + 1 }}</option>{% endfor %}
+      </select>
+    </label>
+    <label id="import-title">作业名称<input name="title" maxlength="120" placeholder="输入作业名称" value="{{ draft or '' }}"></label>
+    <label class="file-field">送审 ZIP<input type="file" name="package" accept=".zip,application/zip" required></label>
+    <details class="upload-options" id="allow-duplicate">
+      <summary>导入选项</summary>
+      <label class="inline-check"><input type="checkbox" name="allow_duplicate" value="1">将相同文件作为独立新作业导入</label>
+    </details>
+    <div class="form-actions"><button class="button primary" type="submit">上传并送审</button></div>
+  </form>
+</section>
+<aside class="panel form-panel format-panel">
+  <h2>压缩包格式</h2>
+  <p>把从 1 开始连续编号的 JPG 或 PNG 放在 <code>pairs/</code> 下。图片上半幅为原片，下半幅为待审画面。</p>
+  <details class="upload-options"><summary>查看目录示例和限制</summary>
+  <pre>pairs/0001.jpg
+pairs/0002.jpg
+…
+manifest.json <span>（可选）</span></pre>
+  <ul><li>同一版的所有图片尺寸一致。</li><li>提供原片 SHA-256 和逐帧时序后，返修版才可沿用匹配画面已取得的通过。</li><li>最多 2,400 帧，压缩包及展开总量各不超过 256 MiB。</li></ul>
+  </details>
+</aside>
+</div>
+{% endblock %}

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}镜头审核{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css', v='workspace-layout-6') }}">
+  <script src="{{ url_for('static', filename='app.js', v='credential-submission-1') }}" defer></script>
+</head>
+<body data-user-id="{{ g.user.id if g.user else '' }}" data-identity-url="{{ url_for('identity') }}">
+{% if g.user %}
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="{{ url_for('index') }}"><span class="brand-mark" aria-hidden="true"><i></i></span> 镜头审核</a>
+    <nav aria-label="主导航">
+      <a href="{{ url_for('index') }}" class="{% if request.endpoint not in ('upload', 'accounts') and request.blueprint != 'execution' %}active{% endif %}">审核队列</a>
+      {% if g.user.role == 'admin' %}<a href="{{ url_for('upload') }}" class="{% if request.endpoint == 'upload' %}active{% endif %}">导入送审</a><a href="{{ url_for('accounts') }}" class="{% if request.endpoint == 'accounts' %}active{% endif %}">账号管理</a><a href="{{ url_for('execution.panel') }}" class="{% if request.blueprint == 'execution' %}active{% endif %}">执行管理</a>{% endif %}
+    </nav>
+    <div class="account">
+      <span class="avatar" aria-hidden="true">{{ g.user.name[:1] }}</span>
+      <div><strong>{{ g.user.name }}</strong><small>{{ '管理员' if g.user.role == 'admin' else '标注员' }}</small></div>
+      <form method="post" action="{{ url_for('sign_out') }}">
+        <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+        <button class="text-button" type="submit">退出</button>
+      </form>
+    </div>
+  </div>
+</header>
+{% endif %}
+<main class="{% block main_class %}page{% endblock %}">
+  {% for category, message in get_flashed_messages(with_categories=true) %}<div class="notice {{ category }}" role="status">{{ message }}</div>{% endfor %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>

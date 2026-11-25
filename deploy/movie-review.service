@@ -1,0 +1,28 @@
+[Unit]
+Description=Movie comparison review platform
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=movie-review
+Group=movie-review
+WorkingDirectory=/opt/movie-review/app
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/movie-review/lib
+Environment=MOVIE_REVIEW_NETWORK=10.10.10.0/24
+Environment=MOVIE_REVIEW_DATA=/var/lib/movie-review
+Environment=TMPDIR=/var/lib/movie-review/tmp
+EnvironmentFile=/etc/movie-review.env
+ExecStart=/usr/bin/python3 -m gunicorn --bind 10.10.10.247:8080 --worker-class gthread --workers 2 --threads 3 --timeout 180 --access-logfile - 'app:create_app()'
+Restart=on-failure
+RestartSec=2
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/movie-review
+
+[Install]
+WantedBy=multi-user.target

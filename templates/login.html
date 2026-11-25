@@ -1,0 +1,23 @@
+{% extends 'base.html' %}
+{% block title %}登录 · 镜头审核{% endblock %}
+{% block main_class %}login-shell{% endblock %}
+{% block content %}
+<div class="login-wrap">
+  <div class="login-art" aria-hidden="true">
+    <div class="login-grid"></div>
+    <div class="login-frame"><span></span></div>
+    <div class="login-orbit"></div>
+    <div class="login-brand"><span class="brand-mark"><i></i></span>镜头审核</div>
+  </div>
+  <section class="login-panel">
+    <h1>登录审核平台</h1>
+    {% if error %}<div class="notice error" role="alert">{{ error }}</div>{% endif %}
+    <form method="post" class="stack">
+      <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+      <label>账号<input name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="64" autofocus></label>
+      <label>密码<input type="password" name="password" autocomplete="current-password" required maxlength="128"></label>
+      <button class="button primary wide" type="submit">登录 <span aria-hidden="true">→</span></button>
+    </form>
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,20 @@
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    include snippets/movie-review-proxy.conf;
+}
+
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+
+    ssl_certificate /etc/movie-review/tls/site.crt;
+    ssl_certificate_key /etc/movie-review/tls/site.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:movie_review_tls:1m;
+
+    include snippets/movie-review-proxy.conf;
+}

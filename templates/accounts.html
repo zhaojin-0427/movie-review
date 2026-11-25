@@ -1,0 +1,144 @@
+{% extends 'base.html' %}
+{% block title %}账号管理 · 镜头审核{% endblock %}
+{% block main_class %}page accounts-page{% endblock %}
+{% block content %}
+<header class="page-heading accounts-heading">
+  <div>
+    <h1>账号管理</h1>
+    <p>管理审核团队的账号、角色和登录权限。</p>
+  </div>
+  <button type="button" class="button primary account-create-link" data-create-account><span aria-hidden="true">＋</span>新建账号</button>
+</header>
+<section class="panel account-directory" aria-labelledby="account-list-heading" data-filter-list>
+  <header class="account-toolbar">
+    <div class="account-directory-title">
+      <h2 id="account-list-heading">团队账号</h2>
+      <span class="account-count" aria-live="polite"><span data-match-count>{{ users|length }}</span> 个账号</span>
+    </div>
+    <div class="list-filters account-filters" hidden>
+      <input class="account-search" type="search" data-filter="search" aria-label="搜索账号" placeholder="搜索姓名或账号">
+      <select data-filter="role" aria-label="角色"><option value="">全部角色</option><option value="admin">管理员</option><option value="reviewer">标注员</option></select>
+      <select data-filter="status" aria-label="登录状态"><option value="">全部状态</option><option value="enabled">启用</option><option value="disabled">停用</option></select>
+    </div>
+  </header>
+  <div class="account-columns" aria-hidden="true">
+    <span>账号</span><span>角色</span><span>登录状态</span><span>领取作业</span><span>操作</span>
+  </div>
+  <ul class="account-list" role="list">
+    {% for user in users %}
+    <li class="account-entry" data-list-item data-search="{{ user.name }} {{ user.username }}" data-role="{{ user.role }}" data-status="{{ 'enabled' if user.enabled else 'disabled' }}" data-account-id="{{ user.id }}" data-owned="{{ user.owned }}">
+      <div class="account-member">
+        <span class="account-initial {{ user.role }}" aria-hidden="true">{{ user.name[:1]|upper }}</span>
+        <div class="account-name">
+          <strong>{{ user.name }}</strong>
+          <span class="mono">{{ user.username }}</span>
+        </div>
+      </div>
+      <div class="account-meta">
+        <span class="account-role"><span class="badge {{ user.role }}">{{ '管理员' if user.role == 'admin' else '标注员' }}</span></span>
+        <span class="account-state"><span class="badge {{ 'enabled' if user.enabled else 'disabled' }}">{{ '启用' if user.enabled else '停用' }}</span></span>
+        <span class="account-owned">
+          {% if user.role == 'reviewer' %}<span class="account-owned-label">已领取 </span><span class="mono">{{ user.owned }}</span> 条{% else %}<span class="account-owned-dash" aria-hidden="true">—</span>{% endif %}
+        </span>
+      </div>
+      <div class="account-actions">
+        {% set can_delete = user.id != g.user.id and not (user.role == 'admin' and user.username|lower == upload_actor) %}
+        {% if user.role == 'reviewer' or can_delete %}
+        <details class="account-menu" name="account-actions">
+          <summary aria-label="管理 {{ user.name }}">管理</summary>
+          <div class="account-menu-body">
+            {% if user.role == 'reviewer' %}
+            <button type="button" data-account-action="{{ 'disable' if user.enabled else 'enable' }}">{{ '停用账号' if user.enabled else '启用账号' }}</button>
+            <button type="button" data-account-action="reset">重置密码</button>
+            {% endif %}
+            {% if can_delete %}
+            <button type="button" class="account-delete" data-account-action="delete">删除账号</button>
+            {% endif %}
+          </div>
+        </details>
+        {% elif user.id == g.user.id %}<span class="field-help">当前账号</span>
+        {% else %}<span class="field-help">上传服务账号</span>{% endif %}
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+  <p class="empty" data-no-matches hidden>没有符合条件的账号</p>
+</section>
+{% if recent %}
+<details class="panel account-history">
+  <summary>最近账号操作</summary>
+  <ul>
+    {% for entry in recent %}
+    <li>
+      <span>{{ entry.actor }} · {{ {'create':'新建','reset':'重置密码','enable':'启用','disable':'停用','delete':'删除'}[entry.action] }} · {{ entry.target }}</span>
+      <time datetime="{{ entry.created_at|replace(' ', 'T') }}Z">{{ entry.created_at }} UTC</time>
+    </li>
+    {% endfor %}
+  </ul>
+</details>
+{% endif %}
+
+<dialog class="account-dialog" id="create-account" aria-labelledby="create-account-heading">
+  <header class="account-dialog-heading"><h2 id="create-account-heading">新建账号</h2></header>
+  <form method="post" class="account-dialog-form">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <label>显示名称<input name="name" required maxlength="60" autofocus></label>
+    <div class="account-form-field">
+      <label for="new-account-username">账号</label>
+      <input id="new-account-username" name="username" autocomplete="off" autocapitalize="none" spellcheck="false" required maxlength="64" aria-describedby="username-help">
+      <p class="field-help" id="username-help">可用汉字、英文字母、数字、点、下划线和连字符。含汉字时为 1–32 个字符，其他账号为 3–32 个字符。</p>
+    </div>
+    <div class="account-form-field">
+      <label for="new-account-role">角色</label>
+      <select id="new-account-role" name="role" aria-describedby="role-help">
+        <option value="reviewer">标注员</option>
+        <option value="admin">管理员</option>
+      </select>
+      <p class="field-help" id="role-help">管理员可导入送审包、查看全部作业和管理账号。</p>
+    </div>
+    <div class="account-form-field">
+      <label for="new-account-password">初始密码</label>
+      <input id="new-account-password" type="password" name="password" autocomplete="new-password" required minlength="12" maxlength="128" aria-describedby="password-help">
+      <p class="field-help" id="password-help">12–128 个字符。</p>
+    </div>
+    <footer class="account-dialog-footer">
+      <button type="button" class="button" data-account-cancel>取消</button>
+      <button class="button primary" name="action" value="create">创建账号</button>
+    </footer>
+  </form>
+</dialog>
+
+<dialog class="account-dialog" id="reset-account" aria-labelledby="reset-account-heading" aria-describedby="reset-account-target">
+  <header class="account-dialog-heading">
+    <h2 id="reset-account-heading">重置密码</h2>
+    <p id="reset-account-target" data-account-target></p>
+  </header>
+  <form method="post" class="account-dialog-form">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <input type="hidden" name="user_id">
+    <div class="account-form-field">
+      <label for="reset-account-password">新密码</label>
+      <input id="reset-account-password" type="password" name="password" autocomplete="new-password" required minlength="12" maxlength="128" aria-describedby="reset-password-help" autofocus>
+      <p class="field-help" id="reset-password-help">12–128 个字符。修改后，该账号需要重新登录。</p>
+    </div>
+    <footer class="account-dialog-footer">
+      <button type="button" class="button" data-account-cancel>取消</button>
+      <button class="button primary" name="action" value="reset">确认重置</button>
+    </footer>
+  </form>
+</dialog>
+
+<dialog class="account-dialog" id="confirm-account" aria-labelledby="confirm-account-heading" aria-describedby="account-confirm-target account-confirm-description">
+  <header class="account-dialog-heading">
+    <h2 id="confirm-account-heading"></h2>
+    <p id="account-confirm-target" data-account-target></p>
+  </header>
+  <p class="account-confirm-description" id="account-confirm-description"></p>
+  <form method="post" class="account-dialog-footer">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <input type="hidden" name="user_id">
+    <button type="button" class="button" data-account-cancel autofocus>取消</button>
+    <button class="button primary" name="action" value="">确认</button>
+  </form>
+</dialog>
+{% endblock %}

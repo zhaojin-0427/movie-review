@@ -1,0 +1,224 @@
+{% extends 'base.html' %}
+{% block title %}执行管理 · 镜头审核{% endblock %}
+{% block main_class %}page execution-page{% endblock %}
+{% block content %}
+<header class="page-heading">
+  <div><h1>执行管理</h1><p>查看设备运行状态，管理接入密钥和制作工单。</p></div>
+</header>
+<nav class="execution-nav" data-section-nav aria-label="执行管理分区">
+  <a href="#devices">设备</a><a href="#credentials">密钥</a><a href="#queue">工单</a>
+</nav>
+{% if secret %}
+<section class="panel form-panel execution-issued" aria-labelledby="issued-title">
+  <div class="section-heading">
+    <div><h2 id="issued-title">已签发 1 枚密钥</h2><p>将以下三项填入执行端的连接设置。请现在复制密钥，列表仅显示这枚密钥的前缀。</p></div>
+  </div>
+  <div class="execution-issued-fields">
+    <label>服务地址<input readonly value="{{ request.url_root.rstrip('/') }}"></label>
+    <label>节点标识<input readonly class="mono" value="{{ issued_node }}"></label>
+    <label>建模 Token<input readonly class="mono" value="{{ secret }}" aria-describedby="copy-credential-status" autocomplete="off"></label>
+  </div>
+  <div class="execution-actions"><button class="button primary" type="button" data-copy-field="token">复制密钥</button><a class="button" href="{{ url_for('execution.panel', _anchor='credentials') }}">查看密钥列表</a><span id="copy-credential-status" role="status"></span></div>
+</section>
+{% endif %}
+
+<div class="execution-grid execution-section" id="devices" data-execution-section>
+  <section class="panel execution-list" aria-labelledby="devices-title" data-filter-list>
+    <header class="section-heading section-heading-panel">
+      <div><h2 id="devices-title">执行设备</h2><p>查看在线状态、槽位、磁盘和当前实例绑定。</p></div>
+      <span class="total"><span data-match-count>{{ nodes|length }}</span> 台</span>
+    </header>
+    {% if nodes %}<p class="device-binding-hint field-help">实例绑定按执行端注册时上报的实例标识限制接入。</p>{% endif %}
+    {% if nodes %}<div class="list-filters" hidden>
+      <label>搜索设备<input type="search" data-filter="search" placeholder="设备名称或节点标识"></label>
+      <label>连接状态<select data-filter="status"><option value="">全部状态</option><option value="online">在线</option><option value="offline">离线</option><option value="pending">待注册</option></select></label>
+      <label>实例绑定<select data-filter="binding"><option value="">全部设备</option><option value="bound">已绑定</option><option value="unbound">未绑定</option></select></label>
+    </div>{% endif %}
+    {% for node in nodes %}
+    <article class="execution-item execution-item-compact" data-list-item data-search="{{ node.name }} {{ node.id }}" data-status="{{ 'online' if node.online else ('offline' if node.seen else 'pending') }}" data-binding="{{ 'bound' if node.bound_instance else 'unbound' }}">
+      <div class="execution-item-head">
+        <div><strong>{{ node.name }}</strong><small class="mono">{{ node.id }}</small></div>
+        <span class="badge {{ 'approved' if node.online else 'paused' }}">{{ '在线' if node.online else ('离线' if node.seen else '待注册') }}</span>
+      </div>
+      <p class="execution-note execution-status-note execution-compact-note">
+        <span>{{ node.active }} / {{ node.cap.slots if node.cap else '—' }} 个槽位执行中</span>
+        <span>{{ node.active_key_count }} 枚有效密钥</span>
+        {% if node.draining %}<span class="status-warning">管理员已暂停领单</span>{% elif node.disk_free is not none and node.disk_free < node.disk_reserve %}<span class="status-warning">磁盘不足，暂停领单</span>{% endif %}
+        {% if node.failure %}<span>最近失败 {{ node.failure }}</span>{% endif %}
+      </p>
+      <details class="execution-details execution-device-details">
+        <summary><span>查看设备详情</span><small>环境、磁盘、实例绑定、能力与设备操作</small></summary>
+        <div class="execution-detail-body">
+          <dl class="execution-facts">
+            <div><dt>设备环境</dt><dd>{{ node.cap.environment.os if node.cap else '—' }}{% if node.cap and node.cap.environment.render_backend %} · {{ node.cap.environment.render_backend }}{% endif %}</dd></div>
+            <div><dt>执行中 / 总槽位</dt><dd>{{ node.active }} / {{ node.cap.slots if node.cap else '—' }}</dd></div>
+            <div><dt>可用磁盘</dt><dd>{{ '%.1f GiB'|format(node.disk_free / 1073741824) if node.disk_free is not none else '未上报' }}</dd></div>
+            <div><dt>预留磁盘</dt><dd>{{ '%.1f GiB'|format(node.disk_reserve / 1073741824) if node.disk_reserve is not none else '未上报' }}</dd></div>
+            <div><dt>最近心跳</dt><dd>{% if node.last_seen %}<time datetime="{{ node.last_seen }}" data-local-time>{{ node.last_seen }}</time>{% else %}—{% endif %}</dd></div>
+          </dl>
+          <div class="device-binding {{ 'is-bound' if node.bound_instance else 'is-pending' }}">
+            <div><span class="eyebrow">实例绑定</span><strong>{{ node.binding_state }}</strong>
+            {% if node.bound_instance %}<small>实例 <span class="mono">{{ node.bound_instance }}</span>{% if node.bound_by_name %} · {{ node.bound_by_name }}{% endif %}</small>
+            {% elif node.instance %}<small>当前实例 <span class="mono">{{ node.instance }}</span></small>
+            {% else %}<small>设备上线并注册后才能绑定</small>{% endif %}</div>
+            {% if request.is_secure %}<form method="post" action="{{ url_for('execution.device_binding', node=node.id) }}" data-confirm="{{ '解除绑定后，新的执行实例可以接入此设备，是否继续？' if node.bound_instance else '将最近注册的实例绑定到此设备，是否继续？' }}">
+              <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+              <input type="hidden" name="instance" value="{{ node.bound_instance or node.instance or '' }}">
+              <button class="button small {{ 'outline-danger' if node.bound_instance else 'primary' }}" name="action" value="{{ 'unbind' if node.bound_instance else 'bind' }}" {% if not node.instance and not node.bound_instance %}disabled{% endif %}>{{ '解除绑定' if node.bound_instance else '绑定当前实例' }}</button>
+            </form>{% endif %}
+          </div>
+          {% if node.cap %}<div class="execution-capability">
+            <div class="execution-detail-label">设备能力</div>
+            <div class="execution-note">{{ node.cap.work_kinds|map('string')|join(' / ') }} · 最大宽度 {{ node.cap.max_frame_width }} px · 渲染后端 {{ node.cap.render_backends|join(' / ') }}</div>
+          </div>{% endif %}
+          <div class="execution-actions execution-item-actions">
+            <form method="post" action="{{ url_for('execution.device_control',node=node.id) }}">
+              <input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="button small" name="action" value="{{ 'resume' if node.draining else 'drain' }}">{{ '恢复领单' if node.draining else '暂停领单' }}</button>
+            </form>
+            {% if node.active %}<small class="field-help">工单结束或暂停后可删除设备</small>
+            {% else %}<form method="post" action="{{ url_for('execution.delete_device',node=node.id) }}" data-confirm="删除设备「{{ node.name }}」？该设备的全部密钥将被撤销，历史工单会保留。">
+              <input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="button small outline-danger">删除设备</button>
+            </form>{% endif %}
+          </div>
+        </div>
+      </details>
+    </article>
+    {% else %}<p class="execution-empty">暂无设备。登记后，将节点标识和密钥填入执行端。</p>{% endfor %}
+    <p class="execution-empty" data-no-matches hidden>没有符合条件的设备。</p>
+  </section>
+  <section class="panel form-panel execution-create-panel" aria-labelledby="register-title">
+    <div class="section-heading"><div><h2 id="register-title">登记设备</h2><p>为一台执行端创建节点和接入密钥。</p></div></div>
+    {% if request.is_secure %}
+    <form method="post" action="{{ url_for('execution.credentials') }}" class="stack" data-credential-submit>
+      <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+      <input type="hidden" name="action" value="create">
+      <input type="hidden" name="submission_id" value="{{ register_request }}">
+      <label>设备名称<input name="name" required maxlength="80" placeholder="例如 剪辑室工作站"></label>
+      <label>密钥有效期<select name="days"><option value="7">7 天</option><option value="30">30 天</option><option value="90" selected>90 天</option><option value="365">365 天</option></select></label>
+      <button class="button primary" type="submit">登记并签发密钥</button>
+    </form>
+    {% else %}<a class="button primary" href="{{ url_for('sign_in', _external=true, _scheme='https', execution_section='devices') }}">切换到 HTTPS 登记设备</a>{% endif %}
+  </section>
+</div>
+
+<section class="panel execution-list execution-section" id="credentials" data-execution-section aria-labelledby="credentials-title" data-filter-list>
+  <header class="section-heading section-heading-panel">
+    <div><h2 id="credentials-title">设备密钥</h2><p>暂停可临时断开接入，恢复后可继续使用原密钥。</p></div>
+    <span class="total"><span data-match-count>{{ tokens|length }}</span> 枚</span>
+  </header>
+  {% if nodes and request.is_secure %}<details class="execution-item execution-fold"><summary>签发新密钥</summary>
+  <form method="post" action="{{ url_for('execution.credentials') }}" class="execution-inline" data-credential-submit>
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <input type="hidden" name="action" value="issue">
+    <input type="hidden" name="submission_id" value="{{ issue_request }}">
+    <label>设备<select name="node" required>{% for node in nodes %}<option value="{{ node.id }}">{{ node.name }} · {{ node.id[-8:] }}</option>{% endfor %}</select></label>
+    <label>有效期<select name="days"><option value="7">7 天</option><option value="30">30 天</option><option value="90" selected>90 天</option><option value="365">365 天</option></select></label><button class="button" type="submit">签发新密钥</button>
+    <p class="field-help">执行端换用新密钥并确认连接后，可暂停并删除旧密钥。</p>
+  </form></details>
+  {% elif request.is_secure %}<div class="execution-item"><a class="button" href="#devices">先登记设备并签发密钥</a></div>
+  {% else %}<div class="execution-item"><a class="button primary" href="{{ url_for('sign_in', _external=true, _scheme='https', execution_section='credentials') }}">切换到 HTTPS 管理密钥</a></div>{% endif %}
+    {% if tokens %}<div class="list-filters" hidden>
+      <label>设备<select data-filter="node"><option value="">全部设备</option>{% for token in tokens|unique(attribute='node', case_sensitive=true) %}<option value="{{ token.node }}">{{ token.name }} · {{ token.node[-8:] }}{{ '（已删除）' if token.node_deleted_at else '' }}</option>{% endfor %}</select></label>
+      <label>密钥状态<select data-filter="status"><option value="">全部状态</option>{% for flag in ('有效', '已暂停', '已过期', '已撤销') %}<option value="{{ flag }}">{{ flag }}</option>{% endfor %}</select></label>
+    </div>{% endif %}
+  {% for token in tokens %}<div class="execution-item execution-key" data-list-item data-node="{{ token.node }}" data-status="{{ token.status }}">
+    <div class="execution-key-main"><strong>{{ token.name }}{{ '（已删除）' if token.node_deleted_at else '' }}</strong><small class="mono">{{ token.prefix }}…</small></div>
+    <div><span class="badge {{ 'approved' if token.status == '有效' else 'paused' }}">{{ token.status }}</span></div>
+    <div class="execution-key-meta">
+      <small>签发 <time datetime="{{ stamp(token.issued) }}" data-local-time>{{ stamp(token.issued) }}</time> · {{ token.issuer }}</small>
+      <small>到期 <time datetime="{{ stamp(token.expires) }}" data-local-time>{{ stamp(token.expires) }}</time></small>
+    </div>
+    {% if request.is_secure %}<form method="post" action="{{ url_for('execution.credentials') }}" class="execution-actions execution-key-actions">
+      <input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="token_id" value="{{ token.id }}">
+      {% if token.status == '有效' %}<button class="button small" name="action" value="pause" data-submit-confirm="暂停此密钥会使它领取的工单租约失效，是否继续？">暂停</button>
+      {% elif token.status == '已暂停' %}<button class="button small" name="action" value="resume">恢复</button>{% endif %}
+      {% if token.status != '有效' %}<button class="button small outline-danger" name="action" value="delete" data-submit-confirm="删除这条密钥记录？删除后此密钥无法恢复。">删除记录</button>{% endif %}
+    </form>{% endif %}
+  </div>{% else %}<p class="execution-empty">尚未签发密钥。</p>{% endfor %}
+    <p class="execution-empty" data-no-matches hidden>没有符合条件的密钥。</p>
+
+</section>
+
+<div class="execution-grid execution-section" id="queue" data-execution-section>
+  <section class="panel execution-list" aria-labelledby="queue-title" data-filter-list>
+    <header class="section-heading section-heading-panel">
+      <div><h2 id="queue-title">工单</h2><p>空闲设备自动领单。已领取的工单由管理员退回后重新排队。</p></div>
+      <span class="total">最近 <span data-match-count>{{ work|length }}</span> 张</span>
+    </header>
+    {% set states = {'queued':'待领取','leased':'执行中','succeeded':'已完成','paused':'已暂停','stopped':'已停止','failed':'待处理'} %}
+    {% if work %}<div class="list-filters" hidden>
+      <label>搜索工单<input type="search" data-filter="search" placeholder="作业名称或编号"></label>
+      <label>工单状态<select data-filter="status"><option value="">全部状态</option>{% for key, label in states.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></label>
+      <label>工单类型<select data-filter="kind"><option value="">全部类型</option>{% for key, label in kinds.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></label>
+      <p class="field-help">在最近 100 张工单中筛选。</p>
+    </div>{% endif %}
+    {% for item in work %}<article class="execution-item execution-item-compact" data-list-item data-search="{{ item.title }} #{{ item.job }}" data-status="{{ item.state }}" data-kind="{{ item.kind }}">
+      <div class="execution-item-head"><div><strong>{{ item.title }}</strong><small>#{{ item.job }} · {{ kinds[item.kind] }} V{{ item.target }}</small></div><span class="badge {{ 'approved' if item.state == 'succeeded' else ('paused' if item.state in ('failed','paused','stopped') else 'waiting') }}">{{ states[item.state] }}</span></div>
+      <p class="execution-note execution-work-summary">{% if item.device %}{{ item.device }} · 第 {{ item.attempt }} 次领取{% elif item.state == 'queued' %}等待设备领取{% else %}暂无领取设备{% endif %}{% if item.stage %} · {{ item.stage }}{% endif %}{% if item.total %} · {{ item.completed }}/{{ item.total }}{% endif %}{% if item.failure %} · {{ {'lease_expired':'设备续租超时','credential_inactive':'设备密钥失效','job_paused':'执行期间暂停','awaiting_return':'等待管理员退回','render_failed':'制作失败','profile_mismatch':'设备配置不匹配'}.get(item.failure,item.failure) }}{% endif %}</p>
+      <div class="execution-actions execution-primary-actions">
+        {% if item.local_review %}<span class="field-help">同机审片 · {% if item.review_instance %}{{ item.review_device }}{% if item.state == 'queued' and not item.review_online %} · 等待原实例上线{% endif %}{% else %}等待支持同机审片的设备{% endif %}</span>{% endif %}
+        {% if item.export_quality %}<span class="field-help">{{ '4K' if item.export_quality == '4k' else '1080p' }}</span>{% endif %}
+        {% if item.review_exists %}<a class="button small" href="{{ url_for('review',job_id=item.job) }}">审核详情</a>{% endif %}
+        {% if item.delivered and item.kind == 'finalize' %}<a class="button small" href="{{ url_for('execution.delivery',job=item.job,version=item.target,role='delivery_bundle') }}">下载交付包</a><a class="button small" href="{{ url_for('execution.delivery',job=item.job,version=item.target,role='white_video') }}">白模视频</a><a class="button small" href="{{ url_for('execution.delivery',job=item.job,version=item.target,role='comparison_video') }}">对比视频</a>{% endif %}
+      </div>
+      <details class="execution-details execution-work-details">
+        <summary><span>查看工单详情</span><small>{% if attempts[item.id] %}领取记录 {{ attempts[item.id]|length }} 条 · {% endif %}工单操作</small></summary>
+        <div class="execution-detail-body">
+          {% if attempts[item.id] %}<section class="execution-detail-section">
+            <h3>领取记录（{{ attempts[item.id]|length }}）</h3>
+            <ul>{% for claim in attempts[item.id] %}<li>第 {{ claim.attempt }} 次 · {{ claim.device }}{% if claim.claimed_at is not none %} · <time datetime="{{ stamp(claim.claimed_at) }}" data-local-time>{{ stamp(claim.claimed_at) }}</time>{% endif %}
+              {% if claim.returned_at is not none %}<br>退回 · {{ claim.returned_by_name }} · <time datetime="{{ stamp(claim.returned_at) }}" data-local-time>{{ stamp(claim.returned_at) }}</time> · {{ claim.return_reason }}{% endif %}</li>{% endfor %}</ul>
+          </section>{% endif %}
+          <section class="execution-detail-section">
+            <h3>工单操作</h3>
+            <div class="execution-action-layout{% if item.state in ('queued','leased','paused','failed') and item.control != 'withdrawn' %} has-control{% endif %}">
+            {% if item.state in ('queued','leased','paused','failed') and item.control != 'withdrawn' %}
+            <form method="post" action="{{ url_for('execution.control',job=item.job) }}" class="stack execution-control-form">
+              <input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="work" value="{{ item.id }}"><input type="hidden" name="state" value="{{ item.state }}"><input type="hidden" name="attempt" value="{{ item.attempt }}">
+              <label>操作原因<input name="reason" required maxlength="250"></label>
+              <div class="execution-actions">
+                {% if item.control == 'paused' %}<button class="button small" name="action" value="resume">恢复</button>
+                {% elif item.state in ('queued','leased') %}<button class="button small" name="action" value="pause">暂停</button>{% endif %}
+                {% if item.control != 'paused' and item.device and item.state in ('leased','failed') %}<button class="button small" name="action" value="return" data-submit-confirm="退回工单将结束当前设备的领取资格，工单会重新排队。确定退回？">退回待领</button>{% endif %}
+                <button class="button small outline-danger" name="action" value="withdraw" data-submit-confirm="停止作业后不能恢复，是否继续？">停止作业</button>
+              </div>
+            </form>{% endif %}
+            {% if item.state == 'leased' %}<p class="field-help execution-note">工单结束或暂停后可删除</p>
+            {% else %}<form method="post" action="{{ url_for('execution.delete_work',work=item.id) }}" class="execution-delete-form" data-confirm="删除「{{ item.title }}」的{{ kinds[item.kind] }} V{{ item.target }} 工单？工单将移出列表，已保存的审核和交付记录会保留。">
+              <input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="state" value="{{ item.state }}"><input type="hidden" name="attempt" value="{{ item.attempt }}">
+              <button class="button small outline-danger">删除工单</button>
+            </form>{% endif %}
+            </div>
+          </section>
+        </div>
+      </details>
+    </article>
+{% else %}<p class="execution-empty">暂无制作工单。上传原片后，系统会生成首版工单。</p>{% endfor %}
+    <p class="execution-empty" data-no-matches hidden>没有符合条件的工单。</p>
+  </section>
+  <section class="panel form-panel execution-create-panel" aria-labelledby="job-create-title">
+    <div class="section-heading"><div><h2 id="job-create-title">上传视频</h2><p>工单以视频文件名命名。</p></div></div>
+    <form method="post" enctype="multipart/form-data" action="{{ url_for('execution.create_job') }}" class="stack" data-batch-upload>
+      <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+      <label class="execution-dropzone" for="execution-source" data-upload-dropzone tabindex="0">
+        <span class="execution-dropzone-icon" aria-hidden="true">↥</span>
+        <strong>拖拽视频到这里</strong>
+        <span>或点击选择多个视频</span>
+        <small>支持 MP4、MOV、MKV、WEBM、M4V</small>
+      </label>
+      <input class="visually-hidden" id="execution-source" type="file" name="source" accept=".mp4,.mov,.mkv,.webm,.m4v" multiple required>
+      <div class="execution-upload-files" data-upload-files hidden></div>
+      <label>审片存储<select name="review_mode">
+        <option value="central">集中存储</option>
+        <option value="node_local_v1">同机审片</option>
+      </select></label>
+      <label>成片质量<select name="export_quality">
+        <option value="1080p">1080p</option>
+        <option value="4k">4K</option>
+      </select><small class="field-help">4K 需要审核版原生宽度为 3840，否则出片时使用 1080p。</small></label>
+      <p class="field-help" data-upload-status aria-live="polite">可一次选择多个视频，每个视频会分别创建一条工单。</p>
+      <button class="button primary" type="submit">上传并排队</button>
+    </form>
+  </section>
+</div>
+{% endblock %}

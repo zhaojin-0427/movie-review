@@ -1,0 +1,72 @@
+{% extends 'base.html' %}
+{% block title %}审核队列 · 镜头审核{% endblock %}
+{% block content %}
+<header class="page-heading">
+  <div><h1>审核队列</h1><p>{{ '查看送审版本、审核进度和返修记录。' if g.user.role == 'admin' else '领取待审作业，查看自己的审核进度。' }}</p></div>
+  {% if g.user.role == 'admin' %}<a class="button primary" href="{{ url_for('upload') }}"><span aria-hidden="true">＋</span> 导入送审包</a>{% endif %}
+</header>
+<nav class="summary-grid" aria-label="按审核状态查看">
+  <a class="summary-card {% if status not in state_names %}selected{% endif %}" href="{{ url_for('index', q=query, owner=owner_filter) }}" {% if status not in state_names %}aria-current="page"{% endif %}><span>全部作业</span><strong>{{ total }}</strong></a>
+  {% for key in (('pool','review','changes','approved','waiting','paused','withdrawn') if g.user.role == 'admin' else ('pool','review','changes','approved','paused')) %}
+    <a class="summary-card {% if status == key %}selected{% endif %}" href="{{ url_for('index', state=key, q=query, owner=owner_filter) }}" {% if status == key %}aria-current="page"{% endif %}>
+      <span><i class="status-dot {{ key }}"></i>{{ state_names[key] }}</span><strong>{{ counts[key] }}</strong>
+    </a>
+  {% endfor %}
+</nav>
+<section class="queue panel">
+  <div class="queue-head">
+    <div class="queue-title"><h2>作业列表</h2><span class="total">{{ rows|length }} 条</span></div>
+  </div>
+  <form method="get" class="filters-panel">
+    <div class="filter-field filter-search">
+      <label for="queue-query">搜索作业</label>
+      <input id="queue-query" type="search" name="q" placeholder="输入名称或编号" aria-label="搜索作业" value="{{ query }}">
+    </div>
+    <div class="filter-field">
+      <label for="queue-state">审核状态</label>
+      <select id="queue-state" name="state" aria-label="按状态筛选">
+        <option value="all">全部状态</option>
+        {% for key, label in state_names.items() %}<option value="{{ key }}" {% if status == key %}selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="filter-field">
+      <label for="queue-owner">标注员</label>
+      <select id="queue-owner" name="owner" aria-label="按标注员筛选">
+        <option value="all" {% if owner_filter == 'all' %}selected{% endif %}>{{ '全部标注员' if g.user.role == 'admin' else '全部可见作业' }}</option>
+        <option value="unassigned" {% if owner_filter == 'unassigned' %}selected{% endif %}>未领取</option>
+        {% if g.user.role == 'reviewer' %}
+        <option value="{{ g.user.id }}" {% if owner_filter == g.user.id|string %}selected{% endif %}>我的作业</option>
+        {% endif %}
+        {% for owner in owner_options %}
+        <option value="{{ owner.id }}" {% if owner_filter == owner.id|string %}selected{% endif %}>{{ owner.name }} · {{ owner.username }}{% if owner.deleted_at %}（已删除）{% elif not owner.enabled %}（已停用）{% endif %}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="filter-actions">
+      <button class="button primary" type="submit">应用筛选</button>
+      <a class="button" href="{{ url_for('index') }}">清除条件</a>
+    </div>
+  </form>
+  {% if rows %}<div class="table-wrap">
+  <table role="table">
+    <thead role="rowgroup"><tr role="row"><th>作业名称</th><th>版本</th><th>审核状态</th><th>通过进度</th><th>标注员</th><th><span class="visually-hidden">操作</span></th></tr></thead>
+    <tbody role="rowgroup">
+      {% for row in rows %}
+      <tr role="row">
+        <td role="cell"><div class="job-cell"><span class="job-icon" aria-hidden="true">▤</span><div><strong>{{ row.title }}</strong><small class="mono">#{{ '%04d'|format(row.id) }}</small></div></div></td>
+        <td role="cell"><span class="version-label mono">V{{ row.version }}</span></td>
+        <td role="cell"><span class="badge {{ row.state }}"><i class="status-dot {{ row.state }}"></i>{{ state_names[row.state] }}</span></td>
+        <td role="cell"><div class="table-progress"><progress value="{{ row.accepted }}" max="{{ row.frame_count }}"></progress><span class="mono">{{ row.accepted }}/{{ row.frame_count }}</span></div></td>
+        <td role="cell" class="queue-owner">{{ row.owner_name or '未领取' }}</td>
+        <td role="cell" class="table-action">
+          {% if row.state == 'pool' and g.user.role == 'reviewer' %}
+            <form action="{{ url_for('claim', job_id=row.id) }}" method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="button small primary">领取</button></form>
+          {% else %}<a class="button small" href="{{ url_for('review', job_id=row.id) }}">{{ '继续审核' if row.state == 'review' and g.user.role == 'reviewer' else '查看' }} <span aria-hidden="true">↗</span></a>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>{% else %}<p class="empty">暂无符合条件的作业，请调整筛选条件。</p>{% endif %}
+</section>
+{% endblock %}
