@@ -302,16 +302,18 @@ def create_app(config=None):
                             (actor_id, target_key, package_hash)).fetchone()
 
     def import_version(stream, job_id, title, actor_id, base_version=None, allow_duplicate=False, *,
-                       channel=None, publish=None, check=None, inherit_only=None):
+                       channel=None, publish=None, check=None, inherit_only=None, stage_frames=None, package_hash=None):
         if channel in {"web", "api"} and job_id and db().execute("SELECT 1 FROM execution_jobs WHERE job=?", (job_id,)).fetchone():
             abort(409, "此作业的返修版由执行工单提交")
-        package_hash = upload_digest(stream)
+        if package_hash is None:
+            package_hash = upload_digest(stream)
         target_key = f"revision:{job_id}:{base_version}" if job_id else f"new:{title}"
         dedupe = channel != "execution" and (not allow_duplicate or job_id is not None)
         if dedupe and (receipt := prior_receipt(actor_id, target_key, package_hash)):
             return receipt["job_id"], receipt["number"], True
         with tempfile.TemporaryDirectory(prefix="incoming-", dir=data) as folder:
-            source_hash, frames = read_package(stream, Path(folder))
+            destination = Path(folder)
+            source_hash, frames = stage_frames(destination) if stage_frames else read_package(stream, destination)
             asset_key = secrets.token_hex(16)
             asset_dir = data / "assets" / asset_key
             try:
@@ -367,7 +369,7 @@ def create_app(config=None):
                     source_label = {"api": "客户端上传 · ", "execution": "制作工单 · "}.get(channel, "")
                     event(conn, job_id, version_id, actor_id, "import",
                           f"{source_label}V{number} · {len(frames)} 帧 · 沿用 {inherited_count} 帧")
-                    Path(folder).rename(asset_dir)
+                    destination.rename(asset_dir)
                     if publish:
                         publish(conn, version_id, number)
             except BaseException:

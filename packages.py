@@ -40,6 +40,10 @@ def read_manifest(archive, entry, count):
         value = json.loads(archive.read(entry))
     except (ValueError, RecursionError) as error:
         raise ValueError("manifest.json 无法解析") from error
+    return read_timeline(value, count)
+
+
+def read_timeline(value, count):
     if not isinstance(value, dict):
         raise ValueError("manifest.json 应为 JSON 对象")
     source = value.get("source_sha256")
@@ -74,11 +78,11 @@ def read_manifest(archive, entry, count):
                     for start, stop in zip(endpoints, endpoints[1:])]
 
 
-def save_frame(archive, entry, destination, number, timing):
+def save_frame(archive, entry, destination, number, timing, *, formats=("JPEG", "PNG")):
     data = archive.read(entry)
     with warnings.catch_warnings():
         warnings.simplefilter("error", Image.DecompressionBombWarning)
-        with Image.open(io.BytesIO(data), formats=["JPEG", "PNG"]) as image:
+        with Image.open(io.BytesIO(data), formats=formats) as image:
             if image.width * image.height > MAX_PIXELS or getattr(image, "is_animated", False):
                 raise ValueError(f"第 {number} 帧尺寸过大或是动图")
             width, height = image.size

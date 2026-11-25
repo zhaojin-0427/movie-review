@@ -1,3 +1,4 @@
+import fcntl
 import hashlib
 import io
 import json
@@ -5,6 +6,7 @@ import re
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from threading import Barrier
@@ -217,7 +219,7 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual(self.machine('POST',path,data,lease=work['lease'],key='complete').json,response)
         return response
 
-    def produce_review(self,work,version,native_size=None,extra_white=False):
+    def produce_review(self,work,version,native_size=None,extra_white=False,check_retry_lock=False):
         inputs = self.artifacts(work)
         frame_size = dict(width=32,height=18)
         timeline = to_json(dict(source_sha256=sha(self.source),time_base='1/1000',end_pts=80,
@@ -257,6 +259,15 @@ class ExecutionTest(unittest.TestCase):
             return self.machine('POST',f'/work/{work["work_id"]}/complete',
                                 dict(input_manifest_sha256=work['input_manifest_sha256'],outputs=outputs),
                                 status=422,key='reject-extra-white',lease=work['lease'])
+        if check_retry_lock:
+            item = next(item for item in outputs if item['role'] == 'review_bundle')
+            with (self.root/'assets'/'execution'/item['artifact_id']).open('rb') as sealed:
+                fcntl.flock(sealed, fcntl.LOCK_EX)
+                blocked = self.machine('POST',f'/work/{work["work_id"]}/complete',
+                                       dict(input_manifest_sha256=work['input_manifest_sha256'],outputs=outputs),
+                                       status=503,key='complete',lease=work['lease'])
+                self.assertEqual(blocked.json['code'],'review_import_in_progress')
+                self.assertTrue(blocked.json['retryable'])
         return self.complete(work,outputs)
 
     def test_local_review_rejects_whites_in_the_zip(self):
@@ -267,6 +278,19 @@ class ExecutionTest(unittest.TestCase):
         result = self.produce_review(work,1,extra_white=True)
         self.assertIn('额外文件',result.json['message'])
         self.assertEqual(self.admin.get('/jobs/'+work['job_id'],base_url=BASE).status_code,404)
+
+    def test_sealed_worker_review_is_independent_of_manual_upload_limit(self):
+        self.setup_profile()
+        self.register()
+        self.heartbeat()
+        work = self.claim('large-worker-review')
+        with patch('app.MAX_PACKAGE', 64), patch('packages.MAX_PACKAGE', 64):
+            receipt = self.produce_review(work,1,check_retry_lock=True)
+            manual = self.post(self.admin, '/admin/import', title='手动送审',
+                               package=(io.BytesIO(zip_bytes({'pairs/0001.jpg':image('JPEG',(32,36),'red')})), 'review.zip'))
+        self.assertEqual((receipt['state'],receipt['version']),('succeeded',1))
+        self.assertEqual(manual.status_code,422)
+        self.assertIn('上传包超过',manual.text)
 
     def test_local_review_stays_with_original_instance_through_revision_and_supplement(self):
         self.run_local_review('1080p', revision=True)

@@ -1,4 +1,5 @@
 """Device administration and the outbound production-worker protocol."""
+import fcntl
 import hashlib
 import json
 import re
@@ -16,7 +17,7 @@ from flask import Blueprint, abort, flash, g, jsonify, redirect, render_template
 from werkzeug.exceptions import HTTPException
 
 from execution_artifacts import (MAX_ARTIFACT, SHA, bundle, canonical, file_hash, frame_size,
-                                 json_object, object_hash, read_json, require, review_package)
+                                 json_object, object_hash, read_json, require, stage_review_frames)
 
 PART_SIZE = 8388608
 LEASE_SECONDS = 90
@@ -259,7 +260,11 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
 
     @machine.errorhandler(ProtocolProblem)
     def protocol_error(error):
-        response = jsonify(code=error.code, message=error.message, request_id=identifier('request'),
+        request_id = identifier('request')
+        if error.status == 422 and request.endpoint == 'machine.complete':
+            app.logger.warning('Execution completion rejected: work=%s request=%s error=%r',
+                               request.view_args['work_id'], request_id, error.message[:400])
+        response = jsonify(code=error.code, message=error.message, request_id=request_id,
                            retryable=error.status in (429, 503))
         response.status_code = error.status
         if error.status == 401:
@@ -779,26 +784,32 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                 approvals = read_json(path_for(inputs['approval_manifest']))
                 signatures = {f['number']:f['review_signature'] for f in approvals['frames']}
                 permitted = {f['number'] for f in version['frames'] if signatures.get(f['number']) == f['review_signature']}
-            with tempfile.TemporaryDirectory(dir=parts_dir) as folder:
-                zipfile = Path(folder) / 'review.zip'
-                review_package(path_for,outputs,timeline,version,zipfile)
-                inactive_base = None if work['kind'] == 'prepare' else work['target'] - 1
+            inactive_base = None if work['kind'] == 'prepare' else work['target'] - 1
 
-                def publish(conn, version_id, number):
-                    nonlocal result
-                    fresh = held(conn,work_id)
-                    require(number == work['target'], '审核版本号已变化')
-                    conn.execute('INSERT INTO execution_versions VALUES(?,?,?)',
-                                 (work['job'],number,json_text(outputs | {'source_timeline':timeline_item})))
-                    result = finish(conn,fresh,operation(conn,body),outputs)
-                    if conn.execute("SELECT 1 FROM versions WHERE id=? AND state='approved'",(version_id,)).fetchone():
-                        after_review(conn,work['job'],version_id,'finalize')
+            def publish(conn, version_id, number):
+                nonlocal result
+                fresh = held(conn,work_id)
+                require(number == work['target'], '审核版本号已变化')
+                conn.execute('INSERT INTO execution_versions VALUES(?,?,?)',
+                             (work['job'],number,json_text(outputs | {'source_timeline':timeline_item})))
+                result = finish(conn,fresh,operation(conn,body),outputs)
+                if conn.execute("SELECT 1 FROM versions WHERE id=? AND state='approved'",(version_id,)).fetchone():
+                    after_review(conn,work['job'],version_id,'finalize')
 
-                result = None
-                with zipfile.open('rb') as stream:
-                    import_version(stream, work['job'], spec['title'],spec['actor'],inactive_base, channel='execution',
-                                   publish=publish, check=lambda conn: held(conn,work_id), inherit_only=permitted)
-                return result
+            result = None
+            review_bundle = outputs['review_bundle']
+            # The client can retry before a large package finishes decoding. Share
+            # the lock across server processes without blocking work heartbeats.
+            with path_for(review_bundle).open('rb') as sealed:
+                try:
+                    fcntl.flock(sealed, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    problem(503, 'review_import_in_progress', '审核包正在入库，请稍后重试')
+                import_version(None, work['job'], spec['title'], spec['actor'], inactive_base, channel='execution',
+                               publish=publish, check=lambda conn: held(conn,work_id), inherit_only=permitted,
+                               stage_frames=lambda destination: stage_review_frames(path_for, outputs, timeline, version, destination),
+                               package_hash=review_bundle['sha256'])
+            return result
         except (KeyError, TypeError, IndexError, UnicodeError, RecursionError, OSError) as error:
             raise ValueError('产物清单缺失必需字段或格式错误') from error
         except ProtocolProblem as error:

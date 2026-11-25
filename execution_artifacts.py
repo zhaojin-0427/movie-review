@@ -6,9 +6,9 @@ import stat
 import unicodedata
 from pathlib import PurePosixPath
 from PIL import Image
-from zipfile import BadZipFile, ZipFile, ZIP_STORED
+from zipfile import BadZipFile, ZipFile
 
-from packages import MAX_FRAMES, MAX_PACKAGE
+from packages import MAX_FRAME, MAX_FRAMES, read_timeline, save_frame
 
 SHA = re.compile(r'[a-f0-9]{64}\Z')
 MAX_ARTIFACT = 16 * 1024**3
@@ -93,7 +93,9 @@ def bundle(path, consume=None, *, indexed=True):
                     checksum = hashlib.file_digest(stream, 'sha256').hexdigest()
                 require(record['size_bytes'] == entry.file_size and record['sha256'] == checksum, '工件成员大小或摘要不匹配')
             if consume:
-                consume(archive, files, index)
+                result = consume(archive, files, index)
+                if result is not None:
+                    return result
             return index
     except (BadZipFile, RuntimeError, NotImplementedError) as error:
         raise ValueError('无法读取工件 ZIP') from error
@@ -105,12 +107,14 @@ def frame_size(value):
     return width, height
 
 
-def review_package(path_for, outputs, timeline, version, target):
+def stage_review_frames(path_for, outputs, timeline, version, destination):
     frames = version['frames']
     ticks = [frame['pts'] for frame in timeline['frames']]
     count = len(frames)
     require(0 < count <= MAX_FRAMES and version['frame_count'] == count and len(ticks) == count,
             '审核帧数与时间线不符')
+    source_hash, timing = read_timeline(dict(source_sha256=timeline['source_sha256'],
+        time_base=timeline['time_base'], pts=ticks, end_pts=timeline['end_pts']), count)
     width, height = frame_size(version['review_size'])
     storage = version.get('review_storage')
     if storage:
@@ -126,32 +130,32 @@ def review_package(path_for, outputs, timeline, version, target):
                     and len(archive.infolist()) == len(files) + 1, '同机审片索引的版号、工程摘要或文件列表无效')
         used = set()
         white_paths = set()
-        length = 0
-        with ZipFile(target, 'w', ZIP_STORED) as output:
-            for n, (frame, tick) in enumerate(zip(frames, ticks, strict=True), 1):
-                image, white = frame['pair_jpeg_path'], frame['white_png_path']
-                require(frame['number'] == n and frame['pts'] == tick and SHA.fullmatch(frame['review_signature'])
-                        and image not in used and white not in white_paths and image != white and image in files,
-                        '审核帧路径、签名或序号无效')
-                used.add(image)
-                white_paths.add(white)
-                if storage:
-                    require(re.fullmatch(r'pairs/[0-9]+[.]jpg', image)
-                            and white.endswith('.png') and not re.search(r'[<>:"\\|?*\x00-\x1f]', white)
-                            and all(part and part not in ('.', '..') and part[-1] not in ' .' for part in white.split('/')),
-                            '同机审片包只接受索引和对比 JPG')
-                else:
-                    require(white in files and white not in used, '审核包缺少白模帧或帧路径重复')
-                    used.add(white)
-                length += files[image].file_size
-                require(length <= MAX_PACKAGE and files[image].file_size <= 32 * 1024**2, '审核图超过平台大小限制')
-                with archive.open(image) as stream, Image.open(stream, formats=['JPEG']) as pair:
-                    require(pair.size == (width, 2 * height), '审核对比图画幅不符')
-                if not storage:
-                    with archive.open(white) as stream, Image.open(stream, formats=['PNG']) as image_file:
-                        require(image_file.size == (width, height), '白模帧画幅不符')
-                output.writestr(f'pairs/{n:04d}.jpg', archive.read(image))
-            require(used == files.keys(), '审核包含额外文件')
-            output.writestr('manifest.json', json.dumps(dict(source_sha256=timeline['source_sha256'],
-                time_base=timeline['time_base'], pts=ticks, end_pts=timeline['end_pts'])))
-    bundle(path_for(outputs['review_bundle']), convert)
+        staged = []
+        for n, (frame, tick, frame_timing) in enumerate(zip(frames, ticks, timing, strict=True), 1):
+            image, white = frame['pair_jpeg_path'], frame['white_png_path']
+            require(frame['number'] == n and frame['pts'] == tick and SHA.fullmatch(frame['review_signature'])
+                    and image not in used and white not in white_paths and image != white and image in files,
+                    '审核帧路径、签名或序号无效')
+            used.add(image)
+            white_paths.add(white)
+            if storage:
+                require(re.fullmatch(r'pairs/[0-9]+[.]jpg', image)
+                        and white.endswith('.png') and not re.search(r'[<>:"\\|?*\x00-\x1f]', white)
+                        and all(part and part not in ('.', '..') and part[-1] not in ' .' for part in white.split('/')),
+                        '同机审片包只接受索引和对比 JPG')
+            else:
+                require(white in files and white not in used, '审核包缺少白模帧或帧路径重复')
+                used.add(white)
+                with archive.open(white) as stream, Image.open(stream, formats=['PNG']) as image_file:
+                    require(image_file.size == (width, height), '白模帧画幅不符')
+            require(0 < files[image].file_size <= MAX_FRAME, f'第 {n} 张审核图文件大小超限')
+            try:
+                saved = save_frame(archive, files[image], destination, n, frame_timing, formats=('JPEG',))
+            except (OSError, SyntaxError, Image.DecompressionBombError, Image.DecompressionBombWarning) as error:
+                raise ValueError(f'第 {n} 张审核图不是有效的 JPEG') from error
+            require((saved.width, saved.height) == (width, 2 * height), '审核对比图画幅不符')
+            staged.append(saved)
+        require(used == files.keys(), '审核包含额外文件')
+        return source_hash, staged
+
+    return bundle(path_for(outputs['review_bundle']), convert)
