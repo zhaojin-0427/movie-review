@@ -722,13 +722,46 @@ def create_app(config=None):
             ) SELECT 1 FROM lineage l JOIN versions v ON v.id=l.id JOIN execution_deliveries d
             ON d.job=v.job_id AND d.version=v.number WHERE d.job=? LIMIT 1""", (version_id, job_id)).fetchone() is not None
 
+    def review_frame(job_id, version, number):
+        frame = db().execute("""SELECT f.*, v.number AS origin FROM frames f
+            LEFT JOIN versions v ON v.id=f.approved_from WHERE f.version_id=? AND f.number=?""",
+                             (version["id"], number)).fetchone()
+        if frame is None:
+            abort(404)
+        prior = db().execute("""SELECT f.note, f.regions FROM frames f JOIN versions v ON v.id=f.version_id
+            WHERE v.job_id=? AND v.number=? AND f.number=? AND f.state='changes'""",
+                             (job_id, version["number"] - 1, number)).fetchone()
+        return frame, prior
+
+    def review_writable(job, version):
+        return (g.user["role"] == "reviewer" and job["owner_id"] == g.user["id"]
+                and job["control"] == "active" and job["version_id"] == version["id"] and version["state"] == "review")
+
+    @app.get("/jobs/<int:job_id>/v/<int:number>/frame-data/<int:frame_no>")
+    @requires()
+    def frame_data(job_id, number, frame_no):
+        db().execute("BEGIN")
+        job = assigned_job(job_id)
+        version = version_row(job_id, number)
+        if request.args.get("revision", type=int) != version["revision"]:
+            abort(409, "审核已更新，请刷新作业后继续")
+        frame, prior = review_frame(job_id, version, frame_no)
+        return jsonify(user_id=g.user["id"], revision=version["revision"], writable=review_writable(job, version),
+                       frame=dict(number=frame_no, state=frame["state"], width=frame["width"], height=frame["height"],
+                                  time_ms=frame["time_ms"], origin=frame["origin"], note=frame["note"],
+                                  regions=json.loads(frame["regions"])),
+                       prior=dict(note=prior["note"], regions=json.loads(prior["regions"]),
+                                  marked_url=url_for("marked_image", job_id=job_id, number=number-1, frame_no=frame_no))
+                       if prior else None)
+
     @app.get("/jobs/<int:job_id>")
     @requires()
     def review(job_id):
+        db().execute("BEGIN")
         job = assigned_job(job_id)
         versions = db().execute("SELECT * FROM versions WHERE job_id=? ORDER BY number DESC", (job_id,)).fetchall()
         version = version_row(job_id, request.args.get("v", job["version"], type=int))
-        frames = db().execute("""SELECT number, state, time_ms, duration_ms FROM frames
+        frames = db().execute("""SELECT number, state FROM frames
                                  WHERE version_id=? ORDER BY number""", (version["id"],)).fetchall()
         selected_filter = request.args.get("frames", "all")
         if selected_filter not in {"all", "pending", "changes", "approved"}:
@@ -742,17 +775,13 @@ def create_app(config=None):
             abort(404)
         previous_frame = next((row["number"] for row in reversed(visible) if row["number"] < current), None)
         next_frame = next((row["number"] for row in visible if row["number"] > current), None)
-        frame = db().execute("""SELECT f.*, v.number AS origin FROM frames f
-            LEFT JOIN versions v ON v.id=f.approved_from WHERE f.version_id=? AND f.number=?""",
-                             (version["id"], current)).fetchone()
-        prior = db().execute("""SELECT f.note, f.regions FROM frames f JOIN versions v ON v.id=f.version_id
-            WHERE v.job_id=? AND v.number=? AND f.number=? AND f.state='changes'""",
-                             (job_id, version["number"] - 1, current)).fetchone()
+        frame, prior = review_frame(job_id, version, current)
+        strip_offset = max(0, next((i for i, row in enumerate(visible) if row["number"] >= current),
+                                   len(visible)) - 16)
         history = db().execute("""SELECT e.*, u.name, v.number AS version FROM events e JOIN users u ON e.actor_id=u.id
             JOIN versions v ON v.id=e.version_id WHERE e.job_id=? AND e.action IN ('import','claim','changes','finish','pause','resume','withdraw','supplement')
             ORDER BY e.id DESC LIMIT 15""", (job_id,)).fetchall()
-        writable = (g.user["role"] == "reviewer" and job["owner_id"] == g.user["id"]
-                    and job["control"] == "active" and job["version_id"] == version["id"] and version["state"] == "review")
+        writable = review_writable(job, version)
         supplement = db().execute("""SELECT parent.number FROM supplements s JOIN versions parent ON parent.id=s.base_id
                                       WHERE s.version_id=?""", (version["id"],)).fetchone()
         execution_job = is_execution_job(job_id)
@@ -765,7 +794,7 @@ def create_app(config=None):
                                supplement_allowed=can_open_supplement(job_id, version["id"], execution_job),
                                frame=frame, writable=writable, regions=json.loads(frame["regions"]),
                                prior=prior, prior_regions=json.loads(prior["regions"]) if prior else [],
-                               history=history, visible=visible, selected_filter=selected_filter,
+                               history=history, visible=visible[strip_offset:strip_offset + 33], selected_filter=selected_filter,
                                previous_frame=previous_frame, next_frame=next_frame, approved=sum(f["state"] == "approved" for f in frames),
                                changes=sum(f["state"] == "changes" for f in frames))
 
@@ -907,7 +936,8 @@ def create_app(config=None):
             conn.execute("UPDATE versions SET revision=revision+1 WHERE id=?", (v_id,))
             conn.execute("UPDATE jobs SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (job_id,))
             event(conn, job_id, v_id, g.user["id"], logged, ", ".join(str(t[0]) for t in targets))
-            if not conn.execute("SELECT 1 FROM frames WHERE version_id=? AND state!='approved'", (v_id,)).fetchone():
+            finished = not conn.execute("SELECT 1 FROM frames WHERE version_id=? AND state!='approved'", (v_id,)).fetchone()
+            if finished:
                 mark_finished(conn, job_id, v_id, g.user["id"])
             elif action == "approve":
                 pending = conn.execute("""SELECT number FROM frames WHERE version_id=? AND state='pending'
@@ -915,7 +945,11 @@ def create_app(config=None):
                 if pending:
                     next_frame = pending["number"]
         selected_filter = request.form.get("frames", "all")
-        return redirect(url_for("review", job_id=job_id, v=number, frame=next_frame, frames=selected_filter), code=303)
+        location = url_for("review", job_id=job_id, v=number, frame=next_frame, frames=selected_filter)
+        if request.accept_mimetypes.best == "application/json":
+            return jsonify(location=location, frame=next_frame, revision=version["revision"] + 1 + int(finished),
+                           reload=finished, frames=[target[0] for target in targets], state=state)
+        return redirect(location, code=303)
 
     @app.post("/jobs/<int:job_id>/v/<int:number>/return")
     @requires("reviewer")
@@ -990,8 +1024,10 @@ def create_app(config=None):
     def readable_error(error):
         messages = {403: "当前账号没有此操作的权限", 404: "找不到该记录，或当前账号没有读取权限",
                     413: "文件超过 256 MiB 的上传上限"}
-        return render_template("error.html", code=error.code,
-                               message=messages.get(error.code, error.description)), error.code
+        message = messages.get(error.code, error.description)
+        if request.endpoint in {"frame_data", "edit_frame"} and request.accept_mimetypes.best == "application/json":
+            return jsonify(message=message), error.code
+        return render_template("error.html", code=error.code, message=message), error.code
 
     return app
 

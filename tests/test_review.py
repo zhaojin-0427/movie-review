@@ -100,6 +100,30 @@ class ReviewTest(unittest.TestCase):
         another = self.upload(payload, allow_duplicate="1")
         self.assertNotEqual(first.location, another.location)
 
+    def test_frame_navigation_and_inline_save_share_permissions_and_revision(self):
+        self.begin(package(TIMING))
+        detail = "/jobs/1/v/1/frame-data/2"
+        headers = {"Accept": "application/json"}
+        response = self.user.get(detail, query_string={"revision": 0}, headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["frame"]["time_ms"], 33)
+        self.assertTrue(response.json["writable"])
+        self.assertEqual(response.headers["Cache-Control"], "private, no-store")
+        self.assertEqual(self.other.get(detail + "?revision=0", headers=headers).status_code, 404)
+        self.assertFalse(self.admin.get(detail + "?revision=0", headers=headers).json["writable"])
+        with self.user.session_transaction() as session:
+            csrf = session["csrf"]
+        values = {"csrf": csrf, "action": "save", "revision": "0", "note": "看第 2 帧", "range_end": "3"}
+        saved = self.user.post("/jobs/1/v/1/frames/2", data=values, headers=headers)
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json, {"location": "/jobs/1?v=1&frame=4&frames=all", "frame": 4,
+                                     "revision": 1, "reload": False, "frames": [2, 3], "state": "changes"})
+        stale = self.user.get(detail + "?revision=0", headers=headers)
+        self.assertEqual(stale.status_code, 409)
+        self.assertIn("刷新", stale.json["message"])
+        self.assertEqual(self.user.get(detail + "?revision=1", headers=headers).json["frame"]["note"], "看第 2 帧")
+        self.assertEqual(self.user.post("/jobs/1/v/1/frames/2", data=values, headers=headers).status_code, 409)
+
     def test_client_upload_authentication_and_replay(self):
         token = "test-upload-only-token"
         self.app.config["UPLOAD_API_TOKEN_SHA256"] = hashlib.sha256(token.encode()).hexdigest()

@@ -1,74 +1,15 @@
 'use strict';
 
 const find = (selector) => document.querySelector(selector);
-const surface = find('#drawing-surface');
-const overlay = find('#overlay');
-const fields = find('#region-fields');
-const form = find('#frame-form');
-const toggle = find('#draw-toggle');
-const help = find('#draw-help');
-const hiddenRegions = find('#regions-input');
-const note = find('#frame-note');
-const data = find('#region-data');
-const regions = data ? JSON.parse(data.dataset.regions) : [];
-const initialRegions = JSON.stringify(regions);
-const initialNote = note?.value;
-let drawing = false;
-let drag;
-let submitting = false;
 const userId = document.body.dataset.userId;
-const initialRange = form?.elements.range_end.value;
-const draftStatus = find('#draft-status');
 const draftPrefix = 'movie-review-draft:';
-const draftKey = form && `${draftPrefix}${userId}:${new URL(form.getAttribute('action'), location.href).pathname}`;
-let storageWorks = true;
-let imageReady = false;
-
-function dirty() {
-  return form && (initialNote !== note.value || initialRegions !== JSON.stringify(regions)
-                  || initialRange !== form.elements.range_end.value);
-}
-
-function clearDraftsForOtherUsers() {
-  try {
-    for (const key of Object.keys(sessionStorage)) {
-      if (key.startsWith(draftPrefix) && (!userId || !key.startsWith(`${draftPrefix}${userId}:`))) {
-        sessionStorage.removeItem(key);
-      }
+try {
+  for (const key of Object.keys(sessionStorage)) {
+    if (key.startsWith(draftPrefix) && (!userId || !key.startsWith(`${draftPrefix}${userId}:`))) {
+      sessionStorage.removeItem(key);
     }
-  } catch (_) { storageWorks = false; }
-}
-
-function storeDraft() {
-  if (!storageWorks || !draftKey) return;
-  try {
-    if (!dirty()) {
-      sessionStorage.removeItem(draftKey);
-      draftStatus.hidden = true;
-      return;
-    }
-    sessionStorage.setItem(draftKey, JSON.stringify({note: note.value, regions,
-      rangeEnd: form.elements.range_end.value, revision: form.dataset.revision}));
-    draftStatus.textContent = '草稿已保存在当前标签页。';
-    draftStatus.hidden = false;
-  } catch (_) { storageWorks = false; }
-}
-
-clearDraftsForOtherUsers();
-if (draftKey && storageWorks) {
-  try {
-    const draft = JSON.parse(sessionStorage.getItem(draftKey));
-    if (draft && draft.revision === form.dataset.revision) {
-      note.value = draft.note;
-      form.elements.range_end.value = draft.rangeEnd;
-      regions.splice(0, regions.length, ...draft.regions);
-      draftStatus.textContent = '已恢复当前标签页的草稿。';
-      draftStatus.hidden = false;
-    } else if (draft) {
-      sessionStorage.removeItem(draftKey);
-    }
-  } catch (_) { storageWorks = false; }
-}
+  }
+} catch (_) { /* Storage can be disabled. */ }
 
 async function checkIdentity() {
   if (!userId) return;
@@ -76,193 +17,15 @@ async function checkIdentity() {
     const response = await fetch(document.body.dataset.identityUrl, {cache: 'no-store'});
     if (response.status === 401 || (response.ok && String((await response.json()).user_id) !== userId)) {
       document.body.hidden = true;
-      submitting = true;
       location.reload();
     }
-  } catch (_) { /* The server still checks authorization on every submission. */ }
+  } catch (_) { /* The server checks authorization for every request. */ }
 }
 window.addEventListener('pageshow', (event) => { if (event.persisted) checkIdentity(); });
 document.addEventListener('visibilitychange', () => { if (!document.hidden) checkIdentity(); });
 
-const picture = surface?.querySelector('img');
-const approve = form?.querySelector('[value="approve"]');
-const zoom = find('#zoom-image');
-if (picture) {
-  if (zoom) zoom.disabled = true;
-  picture.decode().then(() => {
-    imageReady = picture.naturalWidth > 0;
-    if (approve) approve.disabled = !imageReady;
-    if (toggle) toggle.disabled = !imageReady;
-    if (zoom) zoom.disabled = !imageReady;
-  }).catch(() => { find('#image-error').hidden = false; });
-}
-zoom?.addEventListener('click', () => {
-  const enabled = surface.closest('.stage').classList.toggle('zoomed');
-  zoom.setAttribute('aria-pressed', String(enabled));
-  zoom.textContent = enabled ? '适配窗口' : '放大';
-});
-
-function setDrawing(value) {
-  drawing = value;
-  surface.classList.toggle('drawing', value);
-  toggle.setAttribute('aria-pressed', String(value));
-  toggle.textContent = value ? '取消圈选' : '＋ 添加圈选';
-  help.hidden = !value;
-}
-
-function ring(box, index) {
-  const node = document.createElement('div');
-  node.className = index === undefined ? 'ring preview' : 'ring';
-  for (const [name, value] of Object.entries({left: box.x, top: box.y, width: box.w, height: box.h})) {
-    node.style[name] = `${value * 100}%`;
-  }
-  if (index !== undefined) {
-    const badge = document.createElement('span');
-    badge.textContent = index + 1;
-    node.append(badge);
-  }
-  return node;
-}
-
-function updateFields(focusLast = false) {
-  if (!overlay) return;
-  overlay.replaceChildren(...regions.map((region, index) => ring(region, index)));
-  if (!fields) return;
-  fields.replaceChildren();
-  regions.forEach((region, index) => {
-    const row = document.createElement('div');
-    row.className = 'region-row';
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.maxLength = 500;
-    input.placeholder = '填写圈选意见';
-    input.setAttribute('aria-label', `圈选 ${index + 1} 的意见`);
-    input.value = region.note;
-    input.addEventListener('input', () => { region.note = input.value; storeDraft(); });
-    const remove = document.createElement('button');
-    remove.type = 'button';
-    remove.className = 'text-button';
-    remove.textContent = '移除';
-    remove.setAttribute('aria-label', `移除圈选 ${index + 1}`);
-    remove.addEventListener('click', () => {
-      regions.splice(index, 1);
-      storeDraft();
-      updateFields();
-    });
-    row.append(String(index + 1), input, remove);
-    fields.append(row);
-    if (focusLast && index === regions.length - 1) input.focus();
-  });
-}
-
-function point(event) {
-  const bound = surface.getBoundingClientRect();
-  const clamp = (n) => Math.min(1, Math.max(0, n));
-  return {x: clamp((event.clientX - bound.left) / bound.width), y: clamp((event.clientY - bound.top) / bound.height)};
-}
-
-function box(first, last) {
-  return {x: Math.min(first.x, last.x), y: Math.min(first.y, last.y),
-          w: Math.abs(first.x - last.x), h: Math.abs(first.y - last.y)};
-}
-
-if (form) {
-  form.addEventListener('input', storeDraft);
-  toggle.addEventListener('click', () => {
-    if (regions.length >= 24 && !drawing) {
-      alert('一帧最多 24 个圈选。');
-      return;
-    }
-    setDrawing(!drawing);
-  });
-  surface.addEventListener('pointerdown', (event) => {
-    if (!drawing || event.button !== 0 || drag) return;
-    event.preventDefault();
-    surface.setPointerCapture(event.pointerId);
-    drag = {pointer: event.pointerId, start: point(event)};
-  });
-  surface.addEventListener('pointermove', (event) => {
-    if (drag?.pointer !== event.pointerId) return;
-    overlay.querySelector('.preview')?.remove();
-    overlay.append(ring(box(drag.start, point(event))));
-  });
-  surface.addEventListener('pointerup', (event) => {
-    if (drag?.pointer !== event.pointerId) return;
-    const area = box(drag.start, point(event));
-    drag = undefined;
-    overlay.querySelector('.preview')?.remove();
-    if (area.w < .008 || area.h < .008) return;
-    regions.push({...area, note: ''});
-    storeDraft();
-    setDrawing(false);
-    updateFields(true);
-  });
-  surface.addEventListener('pointercancel', () => {
-    drag = undefined;
-    overlay.querySelector('.preview')?.remove();
-  });
-  form.addEventListener('submit', (event) => {
-    const action = event.submitter?.value;
-    if (action === 'approve' && (!imageReady || dirty())) {
-      event.preventDefault();
-      alert(imageReady ? '请先保存或清除当前帧的未提交草稿。' : '图片尚不可用。');
-      return;
-    }
-    if (action === 'save' || action === 'previous') {
-      const missing = regions.findIndex((r) => !r.note.trim());
-      if (missing >= 0) {
-        event.preventDefault();
-        fields.querySelectorAll('input')[missing].focus();
-        alert('请为每个圈选填写意见。');
-        return;
-      }
-      if (action === 'save' && !note.value.trim() && !regions.length) {
-        event.preventDefault();
-        note.focus();
-        alert('请先填写意见或添加圈选。');
-        return;
-      }
-    } else if ((note.value.trim() || regions.length) && !confirm('此操作将清除该帧的意见，是否继续？')) {
-      event.preventDefault();
-      return;
-    }
-    hiddenRegions.value = JSON.stringify(regions);
-    submitting = true;
-  });
-  window.addEventListener('beforeunload', (event) => {
-    if (!submitting && !storageWorks && dirty()) {
-      event.preventDefault();
-      event.returnValue = '';
-    }
-  });
-}
-updateFields();
-
-const current = find('.frame-chip.current');
-if (current && current.offsetLeft > current.parentElement.offsetWidth / 2) {
-  current.parentElement.scrollLeft = current.offsetLeft - current.parentElement.offsetLeft - current.parentElement.clientWidth / 2;
-}
-for (const id of ['#choose-version', '#frame-filter']) {
-  find(id)?.addEventListener('change', (event) => { window.location.assign(event.target.value); });
-}
-if (surface) {
-  document.addEventListener('keydown', (event) => {
-    if (event.target.closest('input, textarea, select, button, a, [contenteditable]') || drawing) return;
-    const selector = {ArrowLeft: '.viewer-controls .previous', ArrowRight: '.viewer-controls .next'}[event.key];
-    const link = selector && find(selector);
-    if (link && link.getAttribute('aria-disabled') !== 'true') {
-      event.preventDefault();
-      link.click();
-    }
-  });
-}
-for (const submitted of document.querySelectorAll('form[data-confirm]')) {
+for (const submitted of document.querySelectorAll('form[data-confirm]:not(.return-form)')) {
   submitted.addEventListener('submit', (event) => {
-    if (submitted.classList.contains('return-form') && dirty()) {
-      event.preventDefault();
-      alert('请先保存当前帧的修改。');
-      return;
-    }
     if (!confirm(submitted.dataset.confirm)) event.preventDefault();
   });
 }

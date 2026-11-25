@@ -120,7 +120,7 @@ progress::-moz-progress-bar { background: #378867; }
 .timeline-head > span { color: var(--muted); font-size: 12px; }
 .jump-form { margin-left: auto; gap: 5px; }
 .jump-form input { width: 68px; min-height: 30px; padding: 4px 6px; }
-.frame-strip { display: flex; gap: 6px; margin-top: 10px; padding: 3px; overflow-x: auto; }
+.frame-strip { position: relative; display: flex; gap: 6px; margin-top: 8px; padding: 4px; overflow-x: auto; }
 .frame-chip { display: grid; place-items: center; gap: 4px; min-width: 33px; padding: 5px 4px; border-radius: 5px; background: #f2f5f3; border: 1px solid var(--border); font: 12px ui-monospace, monospace; }
 .frame-chip.current { outline: 2px solid var(--accent); }
 .frame-chip i { background: #87968d; width: 5px; height: 5px; border-radius: 50%; }
@@ -547,6 +547,44 @@ table tbody tr:hover { background: #f7faff; }
 .timeline-head { justify-content: space-between; flex-wrap: wrap; }
 .timeline-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .timeline-controls .jump-form { margin-left: 0; }
+.review-layout .stage { position: relative; }
+.review-layout .stage:not(.zoomed) .image-wrap {
+  width: min(100%, calc(clamp(230px, 48vh, 740px) * var(--image-width) / var(--image-height)));
+}
+.frame-loading {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  padding: 5px 10px;
+  color: #edf4ff;
+  background: #14243bed;
+  border-radius: 8px;
+  font-size: 12px;
+  pointer-events: none;
+}
+.review-load-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 14px;
+  background: #fceeea;
+  color: #823323;
+}
+.frame-strip-navigation {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+  color: #bacbe2;
+  font-size: 12px;
+}
+.viewer .frame-chip { display: grid; min-width: 40px; padding-inline: 7px; color: #eaf2ff; }
+.viewer .frame-chip.current { background: #355a96; }
+.viewer .frame-chip.approved i { background: #68d7a8; }
+.viewer .frame-chip.changes i { background: #ffc471; }
+.review-save-status { margin-top: -7px; color: var(--muted); font-size: 12px; }
+.progress-legend b { font-weight: 650; }
 .heading-row h1 { overflow-wrap: anywhere; }
 @media (max-width: 690px) {
   .summary-grid { grid-template-columns: repeat(auto-fit, minmax(95px, 1fr)); }
@@ -565,6 +603,9 @@ table tbody tr:hover { background: #f7faff; }
   .review-mobile-jump { display: inline-flex; }
   .timeline .review-mobile-jump { margin-top: 10px; }
   .secondary-actions { flex-wrap: wrap; }
+  .viewer-title, .viewer-controls { gap: 7px; }
+  .viewer-controls .button { padding-inline: 7px; }
+  .viewer .frame-chip { min-height: 40px; }
 }
 
 .accounts-page {

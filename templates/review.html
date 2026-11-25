@@ -1,6 +1,7 @@
 {% extends 'base.html' %}
 {% block title %}{{ job.title }} · 镜头审核{% endblock %}
 {% block main_class %}page review-page{% endblock %}
+{% block page_scripts %}<script src="{{ url_for('static', filename='review.js', v='frame-viewer-1') }}" defer></script>{% endblock %}
 {% block content %}
 {% set job_state = job.control if job.control != 'active' else 'waiting' if job.owner_enabled == 0 and version.state == 'review' else 'pool' if job.owner_id is none else version.state %}
 <a class="back-link" href="{{ url_for('index') }}">← 审核队列</a>
@@ -25,27 +26,37 @@
 {% if job_state == 'waiting' %}<p class="notice">{{ '原标注员账号已删除。该作业保留原归属与审核记录。' if job.owner_deleted_at else '原标注员账号已停用。启用原账号后可继续审核。' }}</p>{% endif %}
 {% if job.control != 'active' %}<p class="notice">{{ state_names[job.control] }} · {{ job.control_reason }}</p>{% endif %}
 {% if supplement %}<p class="notice">基于 V{{ supplement.number }} 的补审</p>{% endif %}
-<div class="review-layout">
+<div class="review-layout" id="review-workspace"
+     data-frame="{{ frame.number }}" data-filter="{{ selected_filter }}" data-version="{{ version.number }}"
+     data-revision="{{ version.revision }}"
+     data-frame-url="{{ url_for('frame_data',job_id=job.id,number=version.number,frame_no=0) }}"
+     data-image-url="{{ url_for('image',job_id=job.id,number=version.number,frame_no=0) }}"
+     data-edit-url="{{ url_for('edit_frame',job_id=job.id,number=version.number,frame_no=0) }}"
+     data-review-url="{{ url_for('review',job_id=job.id) }}">
+  <script type="application/json" id="review-frame-states">{{ frames|map(attribute='state')|list|tojson }}</script>
   <section class="viewer panel" id="review-viewer" aria-label="对比画面">
     <div class="viewer-toolbar">
-      <div class="viewer-title"><strong>逐帧对比</strong><span class="mono">{{ '%04d'|format(frame.number) }} / {{ '%04d'|format(version.frame_count) }}</span></div>
+      <div class="viewer-title"><strong>逐帧对比</strong><span class="mono" id="review-frame-counter">{{ '%04d'|format(frame.number) }} / {{ '%04d'|format(version.frame_count) }}</span></div>
       <div class="viewer-controls">
-        <a class="button small previous" href="{{ url_for('review', job_id=job.id, v=version.number, frame=previous_frame, frames=selected_filter) if previous_frame else '#' }}" {% if not previous_frame %}aria-disabled="true"{% endif %} aria-label="上一帧">←</a>
-        <a class="button small next" href="{{ url_for('review', job_id=job.id, v=version.number, frame=next_frame, frames=selected_filter) if next_frame else '#' }}" {% if not next_frame %}aria-disabled="true"{% endif %} aria-label="下一帧">→</a>
+        <a class="button small previous" href="{{ url_for('review', job_id=job.id, v=version.number, frame=previous_frame, frames=selected_filter) if previous_frame else '#' }}" {% if not previous_frame %}aria-disabled="true"{% endif %} aria-label="上一帧">← 上一帧</a>
+        <a class="button small next" href="{{ url_for('review', job_id=job.id, v=version.number, frame=next_frame, frames=selected_filter) if next_frame else '#' }}" {% if not next_frame %}aria-disabled="true"{% endif %} aria-label="下一帧">下一帧 →</a>
         <button class="button small" id="zoom-image" type="button" aria-pressed="false">放大</button>
       </div>
     </div>
-    <div class="stage">
+    <div class="stage" aria-busy="true">
       <div class="image-wrap" style="--image-ratio: {{ frame.width }} / {{ frame.height }}; --image-height: {{ frame.height }}; --image-width: {{ frame.width }}" id="drawing-surface" {% if writable %}data-editable="true"{% endif %}>
-        <img src="{{ url_for('image', job_id=job.id, number=version.number, frame_no=frame.number) }}" width="{{ frame.width }}" height="{{ frame.height }}" alt="第 {{ frame.number }} 帧，上方原片，下方待审画面" draggable="false">
+        <img src="{{ url_for('image', job_id=job.id, number=version.number, frame_no=frame.number) }}" width="{{ frame.width }}" height="{{ frame.height }}" alt="第 {{ frame.number }} 帧，上方原片，下方待审画面" draggable="false" fetchpriority="high" decoding="async">
         <span class="layer-label upper">原片</span><span class="layer-label lower">待审画面</span>
         <div id="overlay" class="overlay" aria-hidden="true"></div>
       </div>
+      <span id="frame-loading" class="frame-loading" role="status" hidden></span>
     </div>
-    <p class="notice error" id="image-error" role="alert" hidden>图片加载失败。请刷新后重新审核本帧。</p>
+    <div class="review-load-error" id="image-error" hidden>
+      <p role="alert" id="review-error-text"></p><button type="button" class="button small" id="review-retry">重试</button>
+    </div>
     <div class="viewer-footer">
-      <span class="mono">{% if frame.time_ms is not none %}{{ '%0.3f'|format(frame.time_ms / 1000) }} s{% else %}第 {{ frame.number }} 帧{% endif %}</span>
-      <span class="mono">{{ frame.width }} × {{ frame.height }}</span>
+      <span class="mono" id="review-frame-time">{% if frame.time_ms is not none %}{{ '%0.3f'|format(frame.time_ms / 1000) }} s{% else %}第 {{ frame.number }} 帧{% endif %}</span>
+      <span class="mono" id="review-frame-size">{{ frame.width }} × {{ frame.height }}</span>
     </div>
     <section class="timeline" aria-label="帧列表">
       <div class="timeline-head"><strong>帧列表</strong>
@@ -57,29 +68,34 @@
         <form method="get" action="{{ url_for('review', job_id=job.id) }}" class="jump-form">
           <input type="hidden" name="v" value="{{ version.number }}"><input type="hidden" name="frames" value="{{ selected_filter }}"><input type="number" name="frame" min="1" max="{{ version.frame_count }}" placeholder="帧号" aria-label="跳转到帧号" required><button type="submit" class="button small">跳转</button>
         </form>
+        <div class="frame-strip-navigation" hidden>
+          <button type="button" class="button small" id="frame-strip-previous" aria-label="前一组帧">‹</button>
+          <span id="frame-strip-range" class="mono" aria-live="polite"></span>
+          <button type="button" class="button small" id="frame-strip-next" aria-label="后一组帧">›</button>
+        </div>
         </div>
       </div>
-      <div class="frame-strip">
-        {% for item in visible %}<a class="frame-chip {{ item.state }}{% if item.number == frame.number %} current{% endif %}" href="{{ url_for('review', job_id=job.id, v=version.number, frame=item.number, frames=selected_filter) }}" {% if item.number == frame.number %}aria-current="true"{% endif %} aria-label="第 {{ item.number }} 帧 {{ frame_states[item.state] }}" title="第 {{ item.number }} 帧 · {{ frame_states[item.state] }}"><span>{{ '%02d'|format(item.number) }}</span><i></i></a>{% else %}<p class="field-help">没有符合此筛选的帧。</p>{% endfor %}
+      <div class="frame-strip" aria-label="当前组帧">
+        {% for item in visible %}<a class="frame-chip {{ item.state }}{% if item.number == frame.number %} current{% endif %}" data-frame="{{ item.number }}" href="{{ url_for('review', job_id=job.id, v=version.number, frame=item.number, frames=selected_filter) }}" {% if item.number == frame.number %}aria-current="true"{% endif %} aria-label="第 {{ item.number }} 帧 {{ frame_states[item.state] }}"><span>{{ '%02d'|format(item.number) }}</span><i></i></a>{% else %}<p class="field-help">没有符合此筛选的帧。</p>{% endfor %}
       </div>
       {% if writable %}<a class="button small review-mobile-jump" href="#frame-feedback">本帧意见 ↓</a>{% endif %}
     </section>
   </section>
   <aside class="review-sidebar">
     <section class="panel sidebar-panel" aria-label="审核进度">
-      <div class="panel-heading"><h2>审核进度</h2><strong class="mono">{{ approved }} / {{ version.frame_count }}</strong></div>
+      <div class="panel-heading"><h2>审核进度</h2><strong class="mono" id="review-progress-count">{{ approved }} / {{ version.frame_count }}</strong></div>
       <progress class="full-progress" value="{{ approved }}" max="{{ version.frame_count }}"></progress>
-      <div class="progress-legend"><span><i class="status-dot approved"></i>通过 {{ approved }}</span><span><i class="status-dot changes"></i>有问题 {{ changes }}</span><span><i class="status-dot pool"></i>待审 {{ version.frame_count - approved - changes }}</span></div>
+      <div class="progress-legend"><span><i class="status-dot approved"></i>通过 <b data-review-count="approved">{{ approved }}</b></span><span><i class="status-dot changes"></i>有问题 <b data-review-count="changes">{{ changes }}</b></span><span><i class="status-dot pool"></i>待审 <b data-review-count="pending">{{ version.frame_count - approved - changes }}</b></span></div>
     </section>
     <section class="panel sidebar-panel frame-feedback" id="frame-feedback" aria-label="帧意见">
-      <div class="panel-heading"><h2>帧意见</h2><span class="badge {{ frame.state }}"><i class="status-dot {{ frame.state }}"></i>{{ frame_states[frame.state] }}</span></div>
+      <div class="panel-heading"><h2>帧意见</h2><span class="badge {{ frame.state }}" id="review-frame-status"><i class="status-dot {{ frame.state }}"></i>{{ frame_states[frame.state] }}</span></div>
       <div id="region-data" hidden data-regions="{{ regions|tojson|forceescape }}"></div>
-      {% if frame.origin and frame.origin != version.number %}<div class="inherited">沿用 V{{ frame.origin }} 的人工通过</div>{% endif %}
-      {% if prior %}<details class="prior" open><summary>上轮返修意见</summary>
+      <div class="inherited" id="review-inherited"{% if not frame.origin or frame.origin == version.number %} hidden{% endif %}>沿用 V{{ frame.origin }} 的人工通过</div>
+      <div id="review-prior">{% if prior %}<details class="prior" open><summary>上轮返修意见</summary>
         {% if prior.note %}<p class="preserve-lines">{{ prior.note }}</p>{% endif %}
         {% for item in prior_regions %}<p class="preserve-lines">圈选 {{ loop.index }} · {{ item.note }}</p>{% endfor %}
         {% if prior_regions %}<a class="button small" href="{{ url_for('marked_image', job_id=job.id, number=version.number-1, frame_no=frame.number) }}" target="_blank" rel="noopener">查看上轮圈选图 ↗</a>{% endif %}
-      </details>{% endif %}
+      </details>{% endif %}</div>
       {% if writable %}
       <form method="post" action="{{ url_for('edit_frame', job_id=job.id, number=version.number, frame_no=frame.number) }}" id="frame-form" class="stack" data-revision="{{ version.revision }}">
         <input type="hidden" name="frames" value="{{ selected_filter }}">
@@ -98,23 +114,24 @@
         </div>
         <div class="secondary-actions">
           <a class="text-button review-mobile-jump" href="#review-viewer">返回画面 ↑</a>
-          {% if frame.number > 1 %}<button class="text-button" type="submit" name="action" value="previous">同上张图</button>{% endif %}
-          {% if frame.state != 'pending' %}<button class="text-button" type="submit" name="action" value="pending">恢复待审</button>{% endif %}
+          <button class="text-button" type="submit" name="action" value="previous"{% if frame.number <= 1 %} hidden{% endif %}>同上张图</button>
+          <button class="text-button" type="submit" name="action" value="pending"{% if frame.state == 'pending' %} hidden{% endif %}>恢复待审</button>
         </div>
       </form>
-      {% else %}
+      {% else %}<div id="review-readonly-notes">
         {% if frame.note %}<p class="preserve-lines">{{ frame.note }}</p>{% endif %}
         {% for item in regions %}<p class="preserve-lines">圈选 {{ loop.index }} · {{ item.note }}</p>{% endfor %}
         {% if not frame.note and not regions %}<p class="field-help">此帧无修改意见。</p>{% endif %}
-      {% endif %}
+      </div>{% endif %}
     </section>
+    <p class="review-save-status" id="review-save-status" role="status" hidden></p>
     {% if writable and supplement and approved == version.frame_count %}<form class="return-form" method="post" action="{{ url_for('close_supplement', job_id=job.id, number=version.number) }}" data-confirm="结束本轮补审？">
       <input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="revision" value="{{ version.revision }}">
       <button type="submit" class="button wide">结束补审</button>
     </form>{% endif %}
     {% if writable %}<form class="return-form" method="post" action="{{ url_for('return_job', job_id=job.id, number=version.number) }}" data-confirm="提交后将冻结本轮意见，并等待管理员导入返修版。继续退回？">
       <input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="revision" value="{{ version.revision }}">
-      <button type="submit" class="button outline-danger wide" {% if not changes %}disabled{% endif %}>提交意见并退回</button>
+      <button type="submit" class="button outline-danger wide" id="review-return-button" {% if not changes %}disabled{% endif %}>提交意见并退回</button>
     </form>{% endif %}
     {% if export and job.version == version.number %}<section class="panel sidebar-panel" aria-label="成片质量">
       {% if export.locked %}
