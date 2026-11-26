@@ -27,14 +27,14 @@ def annotated_preview(path, regions):
     return buffer.getvalue()
 
 
-def make_feedback_bundle(payload, asset_dir):
+def make_feedback_bundle(payload, frame_source):
     result = tempfile.TemporaryFile()
     try:
         with ZipFile(result, "w", ZIP_STORED) as archive:
             manifest = []
             for row in payload["frames"]:
                 name = f"marked/{row['number']:06}.jpg"
-                archive.writestr(name, annotated_preview(asset_dir / row["asset_name"], row["regions"]))
+                archive.writestr(name, annotated_preview(frame_source(row), row["regions"]))
                 manifest.append({key: value for key, value in row.items() if key != "asset_name"} | {"preview": name})
             archive.writestr("feedback.json", json.dumps(payload | {"frames": manifest}, ensure_ascii=False, indent=2),
                              compress_type=ZIP_DEFLATED)

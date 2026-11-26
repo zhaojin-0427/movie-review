@@ -11,6 +11,8 @@ import sqlite3
 import tempfile
 import time
 import unicodedata
+
+import requests
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -26,6 +28,7 @@ from packages import MAX_PACKAGE, read_package
 from execution import export_options, setup_execution
 from execution_artifacts import object_hash
 from feedback import annotated_preview, make_feedback_bundle
+from oss_storage import Location
 
 ROOT = Path(__file__).resolve().parent
 STATES = {"pool": "待领取", "review": "审核中", "changes": "待返修版", "approved": "已通过",
@@ -137,7 +140,7 @@ def create_app(config=None):
         with write() as conn:
             migrations = {
                 "users": ("deleted_at INTEGER",),
-                "execution_nodes": ("deleted_at INTEGER",),
+                "execution_nodes": ("deleted_at INTEGER", "oss_delivery TEXT NOT NULL DEFAULT 'manual'"),
                 "execution_profiles": ("deleted_at INTEGER",),
                 "execution_jobs": ("local_review INTEGER NOT NULL DEFAULT 0",
                                    "review_node TEXT REFERENCES execution_nodes(id)", "review_instance TEXT",
@@ -247,7 +250,8 @@ def create_app(config=None):
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
-            "form-action 'self'; style-src 'self' 'unsafe-inline'")
+            "form-action 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' https://*.aliyuncs.com; connect-src 'self' https://*.aliyuncs.com")
         if request.endpoint != "static":
             response.headers["Cache-Control"] = "private, no-store"
         return response
@@ -378,7 +382,7 @@ def create_app(config=None):
                 raise
         return job_id, number, False
 
-    after_execution_review, apply_execution_control = setup_execution(
+    after_execution_review, apply_execution_control, oss_fetch_url = setup_execution(
         app, data, db, write, requires, assert_session, import_version, event)
 
     @app.cli.command("init-db")
@@ -834,6 +838,8 @@ def create_app(config=None):
                     time_ms,duration_ms,state,approved_from)
                     SELECT ?,number,asset_name,mimetype,width,height,signature,time_ms,duration_ms,state,approved_from
                     FROM frames WHERE version_id=?""", (version_id, base["id"]))
+                conn.execute("""INSERT INTO oss_frames(version_id,number,location)
+                    SELECT ?,number,location FROM oss_frames WHERE version_id=?""", (version_id,base["id"]))
                 conn.execute("UPDATE jobs SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (job_id,))
                 event(conn, job_id, version_id, g.user["id"], "supplement", f"基于 V{base['number']}")
         except BaseException:
@@ -854,6 +860,22 @@ def create_app(config=None):
             mark_finished(conn, job_id, version["id"], g.user["id"])
         return redirect(url_for("review", job_id=job_id, v=number), code=303)
 
+    def frame_location(version_id, number):
+        row = db().execute('SELECT location FROM oss_frames WHERE version_id=? AND number=?',
+                           (version_id,number)).fetchone()
+        return Location(**json.loads(row['location'])) if row else None
+
+    def frame_source(version, number, asset_name):
+        location = frame_location(version['id'], number)
+        if location is None:
+            return data / 'assets' / version['asset_dir'] / asset_name
+        try:
+            with requests.get(oss_fetch_url(location), timeout=(8,20), allow_redirects=False) as response:
+                response.raise_for_status()
+                return io.BytesIO(response.content)
+        except requests.RequestException as error:
+            raise OSError('OSS 审核图暂不可用') from error
+
     @app.get("/jobs/<int:job_id>/v/<int:number>/image/<int:frame_no>")
     @requires()
     def image(job_id, number, frame_no):
@@ -863,6 +885,9 @@ def create_app(config=None):
                              (version["id"], frame_no)).fetchone()
         if not frame:
             abort(404)
+        location = frame_location(version['id'], frame_no)
+        if location:
+            return redirect(oss_fetch_url(location), code=302)
         path = data / "assets" / version["asset_dir"] / frame["asset_name"]
         if not path.is_file():
             abort(404)
@@ -899,7 +924,8 @@ def create_app(config=None):
             if action == "approve":
                 asset = conn.execute("SELECT asset_name FROM frames WHERE version_id=? AND number=?",
                                      (v_id, frame_no)).fetchone()
-                if not asset or not (data / "assets" / version["asset_dir"] / asset["asset_name"]).is_file():
+                if not asset or (not frame_location(v_id, frame_no)
+                                 and not (data / "assets" / version["asset_dir"] / asset["asset_name"]).is_file()):
                     abort(409, "当前帧图片不可用，无法通过")
                 targets = [(frame_no, "", [], v_id)]
                 state, next_frame, logged = "approved", min(last, frame_no + 1), "approve"
@@ -992,7 +1018,7 @@ def create_app(config=None):
     def download_feedback_bundle(job_id, number):
         version, payload = feedback_payload(job_id, number)
         try:
-            content, length = make_feedback_bundle(payload, data / "assets" / version["asset_dir"])
+            content, length = make_feedback_bundle(payload, lambda row: frame_source(version, row['number'], row['asset_name']))
         except OSError:
             abort(409, "这个版本的部分图片不可用，请联系管理员")
         response = send_file(content, mimetype="application/zip", as_attachment=True,
@@ -1010,7 +1036,7 @@ def create_app(config=None):
         if not row or version["state"] != "changes":
             abort(404)
         try:
-            preview = annotated_preview(data / "assets" / version["asset_dir"] / row["asset_name"], json.loads(row["regions"]))
+            preview = annotated_preview(frame_source(version, frame_no, row['asset_name']), json.loads(row["regions"]))
         except OSError:
             abort(404)
         return send_file(io.BytesIO(preview), mimetype="image/jpeg", etag=False)

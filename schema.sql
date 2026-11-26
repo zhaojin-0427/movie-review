@@ -100,7 +100,8 @@ CREATE TABLE IF NOT EXISTS supplements (
 CREATE TABLE IF NOT EXISTS execution_nodes (
     id TEXT PRIMARY KEY, name TEXT NOT NULL, instance TEXT, capabilities TEXT,
     seen INTEGER, slots INTEGER NOT NULL DEFAULT 0, draining INTEGER NOT NULL DEFAULT 0,
-    disk_free INTEGER, disk_reserve INTEGER, failure TEXT, deleted_at INTEGER
+    disk_free INTEGER, disk_reserve INTEGER, failure TEXT, deleted_at INTEGER,
+    oss_delivery TEXT NOT NULL DEFAULT 'manual' CHECK(oss_delivery IN ('auto','manual'))
 );
 CREATE TABLE IF NOT EXISTS execution_node_bindings (
     node TEXT PRIMARY KEY REFERENCES execution_nodes(id),
@@ -180,3 +181,28 @@ CREATE TABLE IF NOT EXISTS execution_management_events (
     job INTEGER NOT NULL REFERENCES execution_jobs(job), actor INTEGER NOT NULL REFERENCES users(id),
     action TEXT NOT NULL, reason TEXT NOT NULL, occurred_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS oss_settings (
+    id INTEGER PRIMARY KEY CHECK(id=1), region TEXT NOT NULL,
+    source_bucket TEXT NOT NULL, review_bucket TEXT NOT NULL,
+    access_key_id TEXT NOT NULL, encrypted_secret TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS oss_artifacts (
+    artifact TEXT PRIMARY KEY REFERENCES execution_artifacts(id), location TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS oss_frames (
+    version_id INTEGER NOT NULL, number INTEGER NOT NULL, location TEXT NOT NULL,
+    PRIMARY KEY(version_id,number), FOREIGN KEY(version_id,number) REFERENCES frames(version_id,number)
+);
+CREATE TABLE IF NOT EXISTS execution_oss_batches (
+    work TEXT NOT NULL REFERENCES execution_work(id), attempt INTEGER NOT NULL,
+    delivery TEXT NOT NULL CHECK(delivery IN ('auto','manual')),
+    location TEXT NOT NULL, PRIMARY KEY(work,attempt)
+);
+CREATE TABLE IF NOT EXISTS oss_transfers (
+    id TEXT PRIMARY KEY, actor INTEGER REFERENCES users(id), work TEXT REFERENCES execution_work(id),
+    attempt INTEGER, location TEXT NOT NULL, filename TEXT NOT NULL,
+    size_bytes INTEGER, multipart_id TEXT, media_type TEXT NOT NULL, options TEXT NOT NULL,
+    state TEXT NOT NULL, error TEXT, result TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS oss_transfers_state ON oss_transfers(state,created);

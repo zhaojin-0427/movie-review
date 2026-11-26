@@ -1,0 +1,28 @@
+{% extends 'base.html' %}
+{% block title %}OSS 设置 · 镜头审核{% endblock %}
+{% block content %}
+<a class="back-link" href="{{ url_for('execution.panel') }}">← 执行管理</a>
+<header class="page-heading">
+  <div><h1>OSS 设置</h1><p>原片、审核图片和交付文件由阿里云 OSS 传输。</p></div>
+</header>
+<section class="panel form-panel" aria-labelledby="oss-settings-title">
+  <h2 id="oss-settings-title">Bucket 与访问凭据</h2>
+  {% if message %}<p class="notice" role="status">{{ message }}</p>{% endif %}
+  <p class="notice">{{ '已配置云端校验服务地址' if processor_ready else '云端校验服务尚未配置，配置完成后可使用 OSS 上传。' }}</p>
+  <form class="stack" method="post">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <label>地域<input name="region" value="{{ config.region or 'cn-beijing' }}" required pattern="cn-[a-z0-9]+(?:-[a-z0-9]+)*"></label>
+    <label>工单原片 Bucket<input name="source_bucket" value="{{ config.source_bucket or 'video-public' }}" required>
+      <small class="field-help">公共读。执行端通过原片链接直接下载。</small></label>
+    <label>审核与交付 Bucket<input name="review_bucket" value="{{ config.review_bucket or 'video-gr' }}" required>
+      <small class="field-help">私有。审核员通过临时链接读取图片。</small></label>
+    <label>AccessKey ID<input name="access_key_id" autocomplete="off" {% if not config.masked_key %}required{% endif %}>
+      {% if config.masked_key %}<small class="field-help">当前 ID {{ config.masked_key }}。两个密钥字段留空可沿用现有凭据。</small>{% endif %}</label>
+    <label>AccessKey Secret<input name="access_key_secret" type="password" autocomplete="new-password" {% if not config.masked_key %}required{% endif %}></label>
+    <div class="execution-actions">
+      <button class="button primary" name="action" value="save">保存设置</button>
+      <button class="button" name="action" value="test">测试连接</button>
+    </div>
+  </form>
+</section>
+{% endblock %}

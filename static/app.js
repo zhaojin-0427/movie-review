@@ -125,11 +125,38 @@ if (batchUploadForm) {
     dropzone.classList.remove('is-dragging');
     addFiles(event.dataTransfer.files);
   });
-  batchUploadForm.addEventListener('submit', (event) => {
+  batchUploadForm.addEventListener('submit', async (event) => {
     if (!selectedFiles.length) {
       event.preventDefault();
       uploadStatus.textContent = '请先选择至少一个视频文件。';
       sourceInput.focus();
+      return;
+    }
+    if (batchUploadForm.dataset.ossUrl) {
+      event.preventDefault();
+      if (submitButton.disabled) return;
+      submitButton.disabled = true;
+      const results = [];
+      const failed = [];
+      try {
+        for (const file of selectedFiles) {
+          try {
+            const result = await window.movieReviewOssUpload(batchUploadForm, file, null,
+              message => { uploadStatus.textContent = message; });
+            results.push(`#${result.job}${result.reused ? '（已存在）' : ''}`);
+          } catch (error) {
+            failed.push(`${file.name}：${error.message}`);
+          }
+        }
+        if (!failed.length) {
+          location.hash = 'queue';
+          location.reload();
+          return;
+        }
+        uploadStatus.textContent = [...results, ...failed].join(' · ');
+      } finally {
+        submitButton.disabled = false;
+      }
       return;
     }
     submitButton.disabled = true;

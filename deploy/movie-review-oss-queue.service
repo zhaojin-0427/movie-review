@@ -1,0 +1,25 @@
+[Unit]
+Description=Movie review OSS validation queue
+After=network-online.target movie-review.service
+Wants=network-online.target
+
+[Service]
+User=movie-review
+Group=movie-review
+WorkingDirectory=/opt/movie-review/app
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/movie-review/lib
+Environment=MOVIE_REVIEW_DATA=/var/lib/movie-review
+EnvironmentFile=/etc/movie-review.env
+ExecStart=/usr/bin/python3 -m flask --app app:create_app oss-process --watch
+Restart=on-failure
+RestartSec=5
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/movie-review
+
+[Install]
+WantedBy=multi-user.target

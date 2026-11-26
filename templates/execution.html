@@ -1,6 +1,7 @@
 {% extends 'base.html' %}
 {% block title %}执行管理 · 镜头审核{% endblock %}
 {% block main_class %}page execution-page{% endblock %}
+{% block page_scripts %}{% if oss_enabled %}<script src="{{ url_for('static', filename='oss-upload.js', v=1) }}" defer></script>{% endif %}{% endblock %}
 {% block content %}
 {% macro detail_header(id, title, subtitle, status, badge) %}
   <header class="execution-dialog-header">
@@ -23,6 +24,7 @@
 {% endmacro %}
 <header class="page-heading">
   <div><h1>执行管理</h1><p>查看设备运行状态，管理接入密钥和制作工单。</p></div>
+  {% if request.is_secure %}<a class="button" href="{{ url_for('oss.show') }}">OSS 设置</a>{% endif %}
 </header>
 <nav class="execution-nav" data-section-nav aria-label="执行管理分区">
   <a href="#devices">设备</a><a href="#credentials">密钥</a><a href="#queue">工单</a>
@@ -76,6 +78,7 @@
             <div><dt>最近心跳</dt><dd>{% if node.last_seen %}<time datetime="{{ node.last_seen }}" data-local-time>{{ node.last_seen }}</time>{% else %}—{% endif %}</dd></div>
             <div><dt>可用磁盘</dt><dd>{{ '%.1f GiB'|format(node.disk_free / 1073741824) if node.disk_free is not none else '未上报' }}</dd></div>
             <div><dt>预留磁盘</dt><dd>{{ '%.1f GiB'|format(node.disk_reserve / 1073741824) if node.disk_reserve is not none else '未上报' }}</dd></div>
+            <div><dt>OSS 交付</dt><dd>{{ '自动上传' if node.oss_delivery == 'auto' else '手动交付' }}</dd></div>
             <div><dt>有效密钥</dt><dd>{{ node.active_key_count }} 枚</dd></div>
             <div><dt>当前工单</dt><dd>{% for item in running[node.id] %}<span class="execution-running-job">#{{ item.job }} · {{ kinds[item.kind] }} V{{ item.target }}</span>{% else %}—{% endfor %}</dd></div>
             {% if node.failure %}<div><dt>最近失败</dt><dd>{{ node.failure }}</dd></div>{% endif %}
@@ -101,10 +104,21 @@
               <div><dt>渲染后端</dt><dd>{{ node.cap.render_backends|join(' / ') }}</dd></div>
               <div><dt>最大宽度</dt><dd>{{ node.cap.max_frame_width }} px</dd></div>
               <div><dt>同机审片</dt><dd>{{ '支持' if node.cap.review_storage == local_review_mode else '未声明' }}</dd></div>
+              <div><dt>OSS 交付协议</dt><dd>{{ '支持' if node.cap.oss_delivery else '未声明' }}</dd></div>
             </dl>
           </div>{% endif %}
         </section>
         <section class="execution-dialog-body" role="tabpanel" id="{{ node.id }}-actions" aria-labelledby="{{ node.id }}-tab-actions" tabindex="0" hidden>
+          {% if request.is_secure %}
+          <form method="post" class="stack execution-dialog-box" action="{{ url_for('execution.set_oss_delivery',node=node.id) }}">
+            <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+            <label>OSS 交付方式<select name="oss_delivery">
+              <option value="manual"{% if node.oss_delivery == 'manual' %} selected{% endif %}>手动交付</option>
+              <option value="auto"{% if node.oss_delivery == 'auto' %} selected{% endif %}>自动上传 OSS</option>
+            </select></label>
+            <button class="button small" type="submit">保存交付方式</button>
+          </form>
+          {% endif %}
           <div class="execution-actions execution-item-actions">
             <form method="post" action="{{ url_for('execution.device_control',node=node.id) }}">
               <input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="button small" name="action" value="{{ 'resume' if node.draining else 'drain' }}">{{ '恢复领单' if node.draining else '暂停领单' }}</button>
@@ -129,6 +143,7 @@
       <input type="hidden" name="action" value="create">
       <input type="hidden" name="submission_id" value="{{ register_request }}">
       <label>设备名称<input name="name" required maxlength="80" placeholder="例如 剪辑室工作站"></label>
+      <label>OSS 交付方式<select name="oss_delivery"><option value="manual">手动交付</option><option value="auto">自动上传 OSS</option></select></label>
       <label>密钥有效期<select name="days"><option value="7">7 天</option><option value="30">30 天</option><option value="90" selected>90 天</option><option value="365">365 天</option></select></label>
       <button class="button primary" type="submit">登记并签发密钥</button>
     </form>
@@ -147,7 +162,7 @@
     <input type="hidden" name="action" value="issue">
     <input type="hidden" name="submission_id" value="{{ issue_request }}">
     <label>设备<select name="node" required>{% for node in nodes %}<option value="{{ node.id }}">{{ node.name }} · {{ node.id[-8:] }}</option>{% endfor %}</select></label>
-    <label>有效期<select name="days"><option value="7">7 天</option><option value="30">30 天</option><option value="90" selected>90 天</option><option value="365">365 天</option></select></label><button class="button" type="submit">签发新密钥</button>
+      <label>有效期<select name="days"><option value="7">7 天</option><option value="30">30 天</option><option value="90" selected>90 天</option><option value="365">365 天</option></select></label><button class="button" type="submit">签发新密钥</button>
     <p class="field-help">执行端换用新密钥并确认连接后，可暂停并删除旧密钥。</p>
   </form></details>
   {% elif request.is_secure %}<div class="execution-item"><a class="button" href="#devices">先登记设备并签发密钥</a></div>
@@ -180,7 +195,7 @@
       <div><h2 id="queue-title">工单</h2><p>空闲设备自动领单。已领取的工单由管理员退回后重新排队。</p></div>
       <span class="total">最近 <span data-match-count>{{ work|length }}</span> 张</span>
     </header>
-    {% set states = {'queued':'待领取','leased':'执行中','succeeded':'已完成','paused':'已暂停','stopped':'已停止','failed':'待处理'} %}
+    {% set states = {'queued':'待领取','leased':'执行中','succeeded':'已完成','paused':'已暂停','stopped':'已停止','failed':'待处理','awaiting_manual':'待手动交付','verifying':'校验中'} %}
     {% if work %}<div class="list-filters" hidden>
       <label>搜索工单<input type="search" data-filter="search" placeholder="作业名称或编号"></label>
       <label>工单状态<select data-filter="status"><option value="">全部状态</option>{% for key, label in states.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></label>
@@ -189,13 +204,13 @@
     </div>{% endif %}
     {% for item in work %}
     {% set review_mode = local_review_mode if item.local_review else 'central' %}
-    {% set badge = 'approved' if item.state == 'succeeded' else ('review' if item.state == 'leased' else 'paused' if item.state in ('failed','paused','stopped') else 'waiting') %}
+    {% set badge = 'approved' if item.state == 'succeeded' else ('review' if item.state == 'leased' else 'paused' if item.state in ('failed','paused','stopped','awaiting_manual') else 'waiting') %}
     {% set subtitle = '#' ~ item.job ~ ' · ' ~ kinds[item.kind] ~ ' V' ~ item.target %}
     <article class="execution-item execution-card" data-list-item data-search="{{ item.title }} #{{ item.job }}" data-status="{{ item.state }}" data-kind="{{ item.kind }}">
       <div class="execution-card-name"><strong>{{ item.title }}</strong><small>{{ subtitle }}</small></div>
       <div class="execution-card-status">
         <span class="badge {{ badge }}">{{ states[item.state] }}</span>
-        <small>{{ review_modes[review_mode] }}{% if item.device and item.state == 'leased' %} · {{ item.device }}{% endif %}</small>
+        <small>{{ review_modes[review_mode] }}{% if item.device and item.state in ('leased','awaiting_manual','verifying') %} · {{ item.device }}{% endif %}</small>
       </div>
       <button type="button" class="button small execution-card-open" data-open-execution-dialog="{{ item.id }}" aria-haspopup="dialog" aria-controls="{{ item.id }}" aria-label="查看工单详情 {{ subtitle }}">查看详情 <span aria-hidden="true">›</span></button>
       <dialog class="execution-dialog execution-work-details" id="{{ item.id }}" aria-labelledby="{{ item.id }}-title">
@@ -203,7 +218,7 @@
         {{ detail_tabs(item.id, '工单详情', [('overview','概览'),('history','领取记录（' ~ attempts[item.id]|length ~ '）'),('actions','工单操作')]) }}
         <section class="execution-dialog-body" role="tabpanel" id="{{ item.id }}-overview" aria-labelledby="{{ item.id }}-tab-overview" tabindex="0">
           <dl class="execution-facts">
-            <div><dt>当前阶段</dt><dd>{{ item.stage or ('等待设备领取' if item.state == 'queued' else states[item.state]) }}{% if item.total %} · {{ item.completed }}/{{ item.total }}{% endif %}</dd></div>
+            <div><dt>当前阶段</dt><dd>{{ states[item.state] if item.state in ('awaiting_manual','verifying') else item.stage or ('等待设备领取' if item.state == 'queued' else states[item.state]) }}{% if item.total %} · {{ item.completed }}/{{ item.total }}{% endif %}</dd></div>
             <div><dt>执行设备</dt><dd>{{ item.device or '—' }}</dd></div>
             <div><dt>成片画质</dt><dd>{{ {'4k':'4K','1080p':'1080p'}.get(item.export_quality, '原生画幅') }}</dd></div>
           </dl>
@@ -222,17 +237,26 @@
             {% else %}
             <p class="execution-note">{{ review_modes[review_mode] }} · 已锁定</p>
             {% if item.review_exists %}<p class="field-help">审核版本已入库。</p>
-            {% elif item.state in ('leased', 'failed') %}<p class="field-help">退回待领后可切换存储模式。</p>{% endif %}
+            {% elif item.state in ('leased', 'failed','awaiting_manual','verifying') %}<p class="field-help">退回待领后可切换存储模式。</p>{% endif %}
             {% endif %}
             {% if item.local_review %}
             <p class="field-help">{% if item.review_instance %}绑定设备 · {{ item.review_device }}{% if item.state == 'queued' and not item.review_online %} · 等待原实例上线{% endif %}{% elif item.state == 'queued' %}等待支持同机审片的设备领取。{% endif %}</p>
             {% endif %}
           </div>
-          {% if item.review_exists or item.delivered %}
+          {% if oss_enabled and item.state == 'awaiting_manual' %}
+          <form class="stack execution-dialog-box" data-oss-manual
+                data-oss-url="{{ url_for('oss.begin') }}" data-work-id="{{ item.id }}">
+            <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+            <label>手动上传交付 ZIP<input name="submission" type="file" accept=".zip" required></label>
+            <button type="submit" class="button primary">上传并校验</button>
+            <p class="field-help" role="status"></p>
+          </form>
+          {% endif %}
           <div class="execution-actions execution-dialog-links">
+            <a class="button small" href="{{ url_for('execution.source_video',job=item.job) }}">下载原片</a>
             {% if item.review_exists %}<a class="button small" href="{{ url_for('review',job_id=item.job) }}">审核详情</a>{% endif %}
             {% if item.delivered and item.kind == 'finalize' %}<a class="button small" href="{{ url_for('execution.delivery',job=item.job,version=item.target,role='delivery_bundle') }}">下载交付包</a><a class="button small" href="{{ url_for('execution.delivery',job=item.job,version=item.target,role='white_video') }}">白模视频</a><a class="button small" href="{{ url_for('execution.delivery',job=item.job,version=item.target,role='comparison_video') }}">对比视频</a>{% endif %}
-          </div>{% endif %}
+          </div>
         </section>
         <section class="execution-dialog-body" role="tabpanel" id="{{ item.id }}-history" aria-labelledby="{{ item.id }}-tab-history" tabindex="0" hidden>
           {% if attempts[item.id] %}<ol class="execution-claim-history">
@@ -252,19 +276,19 @@
           </ol>{% else %}<p class="execution-note">暂无领取记录。</p>{% endif %}
         </section>
         <section class="execution-dialog-body" role="tabpanel" id="{{ item.id }}-actions" aria-labelledby="{{ item.id }}-tab-actions" tabindex="0" hidden>
-            <div class="execution-action-layout{% if item.state in ('queued','leased','paused','failed') and item.control != 'withdrawn' %} has-control{% endif %}">
-            {% if item.state in ('queued','leased','paused','failed') and item.control != 'withdrawn' %}
+            <div class="execution-action-layout{% if item.state in ('queued','leased','paused','failed','awaiting_manual','verifying') and item.control != 'withdrawn' %} has-control{% endif %}">
+            {% if item.state in ('queued','leased','paused','failed','awaiting_manual','verifying') and item.control != 'withdrawn' %}
             <form method="post" action="{{ url_for('execution.control',job=item.job) }}" class="stack execution-control-form">
               <input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="work" value="{{ item.id }}"><input type="hidden" name="state" value="{{ item.state }}"><input type="hidden" name="attempt" value="{{ item.attempt }}">
               <label>操作原因<input name="reason" required maxlength="250"></label>
               <div class="execution-actions">
                 {% if item.control == 'paused' %}<button class="button small" name="action" value="resume">恢复</button>
-                {% elif item.state in ('queued','leased') %}<button class="button small" name="action" value="pause">暂停</button>{% endif %}
-                {% if item.control != 'paused' and item.device and item.state in ('leased','failed') %}<button class="button small" name="action" value="return" data-submit-confirm="退回工单将结束当前设备的领取资格，工单会重新排队。确定退回？">退回待领</button>{% endif %}
+                {% elif item.state in ('queued','leased','awaiting_manual','verifying') %}<button class="button small" name="action" value="pause">暂停</button>{% endif %}
+                {% if item.control != 'paused' and item.device and item.state in ('leased','failed','awaiting_manual','verifying') %}<button class="button small" name="action" value="return" data-submit-confirm="退回工单将结束当前设备的领取资格，工单会重新排队。确定退回？">退回待领</button>{% endif %}
                 <button class="button small outline-danger" name="action" value="withdraw" data-submit-confirm="停止作业后不能恢复，是否继续？">停止作业</button>
               </div>
             </form>{% endif %}
-            {% if item.state == 'leased' %}<p class="field-help execution-note">工单结束或暂停后可删除</p>
+            {% if item.state in ('leased','verifying') %}<p class="field-help execution-note">工单结束或暂停后可删除</p>
             {% else %}<form method="post" action="{{ url_for('execution.delete_work',work=item.id) }}" class="execution-delete-form" data-confirm="删除「{{ item.title }}」的{{ kinds[item.kind] }} V{{ item.target }} 工单？工单将移出列表，已保存的审核和交付记录会保留。">
               <input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="state" value="{{ item.state }}"><input type="hidden" name="attempt" value="{{ item.attempt }}">
               <button class="button small outline-danger">删除工单</button>
@@ -279,7 +303,7 @@
   </section>
   <section class="panel form-panel execution-create-panel" aria-labelledby="job-create-title">
     <div class="section-heading"><div><h2 id="job-create-title">上传视频</h2><p>工单以视频文件名命名。</p></div></div>
-    <form method="post" enctype="multipart/form-data" action="{{ url_for('execution.create_job') }}" class="stack" data-batch-upload>
+    <form method="post" enctype="multipart/form-data" action="{{ url_for('execution.create_job') }}" class="stack" data-batch-upload{% if oss_enabled %} data-oss-url="{{ url_for('oss.begin') }}"{% endif %}>
       <input type="hidden" name="csrf" value="{{ csrf_token() }}">
       <label class="execution-dropzone" for="execution-source" data-upload-dropzone tabindex="0">
         <span class="execution-dropzone-icon" aria-hidden="true">↥</span>
@@ -290,7 +314,7 @@
       <input class="visually-hidden" id="execution-source" type="file" name="source" accept=".mp4,.mov,.mkv,.webm,.m4v" multiple required>
       <div class="execution-upload-files" data-upload-files hidden></div>
       <label>审片存储<select name="review_mode">
-        {% for key, label in review_modes.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}
+        {% for key, label in review_modes.items() %}<option value="{{ key }}"{% if key == local_review_mode %} selected{% endif %}>{{ label }}</option>{% endfor %}
       </select></label>
       <label>成片质量<select name="export_quality">
         <option value="1080p">1080p</option>

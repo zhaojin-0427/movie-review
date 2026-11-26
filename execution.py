@@ -1,4 +1,5 @@
 """Device administration and the outbound production-worker protocol."""
+import base64
 import fcntl
 import hashlib
 import json
@@ -16,7 +17,11 @@ from uuid import UUID
 from flask import Blueprint, abort, flash, g, jsonify, redirect, render_template, request, send_file, url_for
 from werkzeug.exceptions import HTTPException
 
-from execution_artifacts import (MAX_ARTIFACT, SHA, bundle, canonical, file_hash, frame_size,
+from oss_storage import PREFIX, URL_SECONDS, Location, platform_bucket, settings
+from oss_workflow import setup_oss
+from packages import Frame
+
+from execution_artifacts import (MAX_ARTIFACT, MAX_JSON, SHA, bundle, canonical, file_hash, frame_size,
                                  json_object, object_hash, read_json, require, stage_review_frames)
 
 PART_SIZE = 8388608
@@ -101,6 +106,47 @@ def export_options(conn, objects, job):
                 labels=EXPORT_QUALITIES)
 
 
+def validate_delivery(path_for, order, inputs, outputs, verification, work):
+    version = read_json(path_for(inputs['version_manifest']))
+    approvals = read_json(path_for(inputs['approval_manifest']))
+    count = version['frame_count']
+    final_size = export_size(version['final_size'], order.get('export_quality'))
+    common = dict(version_manifest_sha256=inputs['version_manifest']['sha256'],
+                  approval_manifest_sha256=inputs['approval_manifest']['sha256'],
+                  timeline_sha256=inputs['source_timeline']['sha256'])
+    require(isinstance(verification,dict) and all(verification.get(k) == v for k,v in common.items())
+            and verification.get('scene_sha256') == version['scene_sha256']
+            and len(approvals['frames']) == count and approvals['scope'] == 'all_frames'
+            and all(verification.get(k) == count for k in ('frame_count','verified_review_frames',
+                    'white_frame_count','comparison_frame_count'))
+            and verification.get('pts_verified') is True and verification.get('audio_verified') is True
+            and verification.get('white_size') == final_size, '出片核验记录与已审核版本或出片画幅不一致')
+    w,h = frame_size(final_size)
+    require(verification.get('comparison_size') == dict(width=w,height=2*h)
+            and (verification.get('render_source') == 'locked_scene_native_render' or
+                 (verification.get('render_source') == 'approved_native_white' and version['review_size'] == final_size)),
+            '出片画幅或渲染来源不匹配')
+    def check_delivery(archive,files,index):
+        indexed = index['files']
+        for prefix, item in (('target/',inputs['source_video']), ('white_model/',outputs['white_video']),
+                             ('comparison/',outputs['comparison_video'])):
+            selected = [record for record in indexed if record['path'].startswith(prefix)]
+            require(len(selected)==1 and selected[0]['sha256']==item['sha256'] and selected[0]['size_bytes']==item['size_bytes'],
+                    '交付包视频与封存对象不一致')
+        require(any(k.startswith('model_3d/') and k.endswith('.blend') and files[k].file_size > 0 for k in files)
+                and any(k.startswith('meta/') and k.endswith('.jsonl') and files[k].file_size > 0 for k in files),
+                '交付包缺少可编辑工程或镜头描述')
+        require(any(record['path'].startswith('model_3d/') and record['sha256'] == version['scene_sha256'] for record in indexed)
+                and any(record['path'].startswith('meta/') and record['sha256'] == inputs['shot_metadata']['sha256'] for record in indexed),
+                '交付工程或镜头描述与批准版本不一致')
+        if order.get('review_storage'):
+            require(any(record['path'] == 'model_3d/scene.blend' and record['sha256'] == version['scene_sha256']
+                        for record in indexed), '交付工程 scene.blend 与审核版不符')
+    index = bundle(path_for(outputs['delivery_bundle']),check_delivery)
+    require(all(index.get(k) == v for k,v in common.items()) and index.get('job_id') == str(work['job'])
+            and index.get('version') == work['target'] and index.get('final_size') == final_size, '交付包索引不匹配')
+
+
 class ProtocolProblem(Exception):
     def __init__(self, status, code, message):
         self.status = status
@@ -126,6 +172,17 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
             problem(404, 'artifact_not_found', '工件不存在')
         return dict(artifact_id=row['id'], role=row['role'], sha256=row['sha256'],
                     size_bytes=row['size_bytes'], media_type=row['media_type'])
+
+    def location_for(conn, artifact_id):
+        row = conn.execute('SELECT location FROM oss_artifacts WHERE artifact=?', (artifact_id,)).fetchone()
+        return Location(**json.loads(row['location'])) if row else None
+
+    def fetch_url(location):
+        config = settings(db())
+        if config is None:
+            abort(503, '请配置 OSS 凭据')
+        builder = app.config.get('OSS_BUCKET_FACTORY', platform_bucket)
+        return builder(location, config, app.secret_key).sign_url('GET', location.key, URL_SECONDS, slash_safe=True)
 
     def path_for(item):
         return objects / item['artifact_id']
@@ -233,8 +290,8 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
             conn.execute('''UPDATE execution_work SET state=CASE WHEN node IS NULL THEN 'queued' ELSE 'failed' END,
                          updated=?,available_at=0 WHERE job=? AND state='paused' ''', (now(),job))
             return
-        before, after = {'pause': (('queued','leased'), 'paused'),
-                         'withdraw': (('queued','leased','paused','failed'), 'stopped')}[action]
+        before, after = {'pause': (('queued','leased','awaiting_manual','verifying'), 'paused'),
+                         'withdraw': (('queued','leased','paused','failed','awaiting_manual','verifying'), 'stopped')}[action]
         placeholders = ','.join('?' for _ in before)
         conn.execute(f'''UPDATE execution_work SET state=?,lease=NULL,expires=NULL,updated=?,available_at=0,
                          failure=CASE WHEN state='leased' AND ?='paused' THEN 'job_paused' ELSE failure END
@@ -247,6 +304,10 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
             (expires<=? OR EXISTS(SELECT 1 FROM execution_tokens t WHERE t.id=execution_work.token
                                    AND (t.revoked IS NOT NULL OR t.paused_at IS NOT NULL OR t.expires<=?)))''',
                      (cutoff, cutoff, cutoff, cutoff))
+        conn.execute('''UPDATE execution_work SET state='failed', stage=NULL, updated=?, failure='credential_inactive'
+            WHERE state IN ('awaiting_manual','verifying') AND EXISTS(
+                SELECT 1 FROM execution_tokens t WHERE t.id=execution_work.token
+                AND (t.revoked IS NOT NULL OR t.paused_at IS NOT NULL))''', (cutoff,))
 
     @machine.before_request
     def authenticate():
@@ -359,6 +420,8 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
             known = {k: environment[k] for k in env_keys if bounded(environment.get(k),200)}
             cap = {k: cap[k] for k in ('slots','max_frame_width','render_backends','work_kinds')}
             cap['environment'] = known
+            if body['capabilities'].get('oss_delivery') is True:
+                cap['oss_delivery'] = True
             if review_mode:
                 cap['review_storage'] = review_mode
         except (KeyError, TypeError, AttributeError) as error:
@@ -378,7 +441,7 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                 if node['instance'] != instance:
                     problem(409, 'worker_unknown', '注册实例已被替换')
                 previous = json.loads(node['capabilities'])
-                if previous.get('review_storage') != review_mode:
+                if any(previous.get(key) != cap.get(key) for key in ('review_storage','oss_delivery')):
                     conn.execute('UPDATE execution_nodes SET capabilities=? WHERE id=?', (json_text(cap), g.node))
                 response = saved_response(conn,op)
                 response[0].headers['X-Film-Worker-Storage'] = '1'
@@ -449,6 +512,10 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                         if row['kind'] not in kinds or row['kind'] not in cap['work_kinds']:
                             continue
                         manifest = json.loads(row['manifest'])
+                        source_id = next(item['artifact_id'] for item in manifest['artifacts'] if item['role'] == 'source_video')
+                        source_location = location_for(conn, source_id)
+                        if source_location and (not cap.get('oss_delivery') or not processor_ready or not settings(conn)):
+                            continue
                         if row['local_review']:
                             if cap.get('review_storage') != LOCAL_REVIEW:
                                 continue
@@ -476,9 +543,19 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                         conn.execute('INSERT INTO execution_attempts(work,attempt,node,claimed_at) VALUES(?,?,?,?)',
                                      (row['id'],attempt,g.node,claimed))
                         conn.execute('UPDATE execution_nodes SET slots=slots-1 WHERE id=?',(g.node,))
-                        return saved_response(conn, op, dict(work_id=row['id'], job_id=str(row['job']), kind=row['kind'],
+                        assignment = dict(work_id=row['id'], job_id=str(row['job']), kind=row['kind'],
                             lease=dict(lease_id=lease, attempt=attempt, fence=attempt, worker_id=g.node, expires_at=stamp(expires)),
-                            input_manifest=manifest,input_manifest_sha256=digest))
+                            input_manifest=manifest, input_manifest_sha256=digest)
+                        if source_location:
+                            config = settings(conn)
+                            delivery = node['oss_delivery']
+                            target = Location(config['region'], config['review_bucket'],
+                                f'{PREFIX}/incoming/work/{row["job"]}/{row["id"]}/{attempt}/{identifier("bundle")}.zip')
+                            conn.execute('INSERT INTO execution_oss_batches VALUES(?,?,?,?)',
+                                         (row['id'], attempt, delivery, json_text(target.public())))
+                            assignment['oss'] = dict(source_url=source_location.url, delivery=delivery,
+                                                     upload=target.public() if delivery == 'auto' else None)
+                        return saved_response(conn, op, assignment)
                 if time.monotonic() >= deadline or not accepts(node):
                     return saved_response(conn, op, status=204)
             time.sleep(min(.5, max(0, deadline - time.monotonic())))
@@ -556,6 +633,9 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
         if key not in permitted:
             problem(404, 'artifact_not_found', '该工件不在当前工单的冻结输入中')
         item = permitted[key]
+        location = location_for(conn, key)
+        if location:
+            return redirect(location.url if item['role'] == 'source_video' else fetch_url(location), code=302)
         return send_file(path_for(item), mimetype=item['media_type'], conditional=True, etag=item['sha256'])
 
     def part_count(row):
@@ -597,6 +677,8 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
             op = operation(conn,body)
             if op[2]:
                 return saved_response(conn,op)
+            if oss_batch(conn, row):
+                problem(409, 'oss_required', '此工单需要使用 OSS 交付')
             found = conn.execute('SELECT * FROM execution_uploads WHERE work=? AND attempt=? AND role=?',
                                  (work,row['attempt'],role)).fetchone()
             if found:
@@ -697,52 +779,15 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                 '产物与本次租约下已封存的对象不符')
         return order, {item['role']:item for item in order['artifacts']}, items
 
-    def finish(conn,work,op,outputs):
+    def completion_receipt(conn,work,outputs):
         receipt = dict(receipt_id=identifier('receipt'),job_id=str(work['job']),work_id=work['id'],attempt=work['attempt'],kind=work['kind'],state='succeeded',
                        version=work['target'],committed_at=stamp(),artifacts=list(outputs.values()))
         conn.execute("UPDATE execution_work SET state='succeeded',updated=?,receipt=?,lease=NULL,expires=NULL,failure=NULL WHERE id=?",
                      (now(),json_text(receipt),work['id']))
-        return saved_response(conn,op,receipt)
+        return receipt
 
-    def validate_delivery(order,inputs,outputs,verification,work):
-        version = read_json(path_for(inputs['version_manifest']))
-        approvals = read_json(path_for(inputs['approval_manifest']))
-        count = version['frame_count']
-        final_size = export_size(version['final_size'], order.get('export_quality'))
-        common = dict(version_manifest_sha256=inputs['version_manifest']['sha256'],
-                      approval_manifest_sha256=inputs['approval_manifest']['sha256'],
-                      timeline_sha256=inputs['source_timeline']['sha256'])
-        require(isinstance(verification,dict) and all(verification.get(k) == v for k,v in common.items())
-                and verification.get('scene_sha256') == version['scene_sha256']
-                and len(approvals['frames']) == count and approvals['scope'] == 'all_frames'
-                and all(verification.get(k) == count for k in ('frame_count','verified_review_frames',
-                        'white_frame_count','comparison_frame_count'))
-                and verification.get('pts_verified') is True and verification.get('audio_verified') is True
-                and verification.get('white_size') == final_size, '出片核验记录与已审核版本或出片画幅不一致')
-        w,h = frame_size(final_size)
-        require(verification.get('comparison_size') == dict(width=w,height=2*h)
-                and (verification.get('render_source') == 'locked_scene_native_render' or
-                     (verification.get('render_source') == 'approved_native_white' and version['review_size'] == final_size)),
-                '出片画幅或渲染来源不匹配')
-        def check_delivery(archive,files,index):
-            indexed = index['files']
-            for prefix, item in (('target/',inputs['source_video']), ('white_model/',outputs['white_video']),
-                                 ('comparison/',outputs['comparison_video'])):
-                selected = [record for record in indexed if record['path'].startswith(prefix)]
-                require(len(selected)==1 and selected[0]['sha256']==item['sha256'] and selected[0]['size_bytes']==item['size_bytes'],
-                        '交付包视频与封存对象不一致')
-            require(any(k.startswith('model_3d/') and k.endswith('.blend') and files[k].file_size > 0 for k in files)
-                    and any(k.startswith('meta/') and k.endswith('.jsonl') and files[k].file_size > 0 for k in files),
-                    '交付包缺少可编辑工程或镜头描述')
-            require(any(record['path'].startswith('model_3d/') and record['sha256'] == version['scene_sha256'] for record in indexed)
-                    and any(record['path'].startswith('meta/') and record['sha256'] == inputs['shot_metadata']['sha256'] for record in indexed),
-                    '交付工程或镜头描述与批准版本不一致')
-            if order.get('review_storage'):
-                require(any(record['path'] == 'model_3d/scene.blend' and record['sha256'] == version['scene_sha256']
-                            for record in indexed), '交付工程 scene.blend 与审核版不符')
-        index = bundle(path_for(outputs['delivery_bundle']),check_delivery)
-        require(all(index.get(k) == v for k,v in common.items()) and index.get('job_id') == str(work['job'])
-                and index.get('version') == work['target'] and index.get('final_size') == final_size, '交付包索引不匹配')
+    def finish(conn,work,op,outputs):
+        return saved_response(conn,op,completion_receipt(conn,work,outputs))
 
     @machine.post('/work/<work_id>/complete')
     def complete(work_id):
@@ -755,7 +800,7 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
             work = held(conn,work_id)
             order,inputs,outputs = output_set(conn,work,body)
             if work['kind'] == 'finalize':
-                validate_delivery(order,inputs,outputs,body.get('final_verification'),work)
+                validate_delivery(path_for, order, inputs, outputs, body.get('final_verification'), work)
                 with write() as conn:
                     current_token(conn)
                     op = operation(conn,body)
@@ -787,11 +832,7 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                         '工程摘要与送审版本不匹配')
             frame_size(version['final_size'])
             spec = job_inputs(conn,work['job'])
-            permitted = set()
-            if work['kind'] == 'revise':
-                approvals = read_json(path_for(inputs['approval_manifest']))
-                signatures = {f['number']:f['review_signature'] for f in approvals['frames']}
-                permitted = {f['number'] for f in version['frames'] if signatures.get(f['number']) == f['review_signature']}
+            permitted = approved_frames(work, inputs, version)
             inactive_base = None if work['kind'] == 'prepare' else work['target'] - 1
 
             def publish(conn, version_id, number):
@@ -871,6 +912,9 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
             status = dict(job_id=str(job),job_state=job_state,work_id=work_id,work_state=state,attempt=work['attempt'],
                           directive=directive,current_version=current['number'] if current else 0,
                           delivery_versions=deliveries,terminal=state in TERMINAL,server_time=stamp())
+            if state in ('awaiting_manual','verifying','failed'):
+                status['stage'] = work['stage']
+                status['failure'] = work['failure']
             if work['receipt']:
                 status['receipt'] = json.loads(work['receipt'])
             return jsonify(status)
@@ -927,7 +971,214 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
         return render_template('execution.html', nodes=nodes, tokens=history, work=work, attempts=attempts,
                                running=running, kinds=KINDS, secret=secret, issued_node=issued_node, stamp=stamp,
                                review_modes=REVIEW_MODES, local_review_mode=LOCAL_REVIEW, review_mode_editable=review_mode_editable,
-                               register_request=secrets.token_hex(16), issue_request=secrets.token_hex(16))
+                               register_request=secrets.token_hex(16), issue_request=secrets.token_hex(16),
+                               oss_enabled=bool(processor_ready and settings(conn)))
+
+    def approved_frames(work, inputs, version):
+        if work['kind'] != 'revise':
+            return set()
+        approvals = read_json(path_for(inputs['approval_manifest']))
+        signatures = {frame['number']: frame['review_signature'] for frame in approvals['frames']}
+        return {frame['number'] for frame in version['frames']
+                if signatures.get(frame['number']) == frame['review_signature']}
+
+    def oss_batch(conn, work):
+        return conn.execute('SELECT * FROM execution_oss_batches WHERE work=? AND attempt=?',
+                            (work['id'], work['attempt'])).fetchone()
+
+    def manual_batch(conn, work, attempt=None):
+        return conn.execute("""SELECT b.* FROM execution_oss_batches b
+            JOIN execution_work w ON w.id=b.work AND w.attempt=b.attempt
+            JOIN execution_tokens t ON t.id=w.token AND t.revoked IS NULL AND t.paused_at IS NULL
+            WHERE w.id=? AND w.state='awaiting_manual' AND w.deleted_at IS NULL
+              AND b.delivery='manual' AND (? IS NULL OR b.attempt=?)""", (work,attempt,attempt)).fetchone()
+
+    @machine.post('/work/<work_id>/oss/submit')
+    def oss_submit(work_id):
+        body = payload()
+        with write() as conn:
+            current_token(conn)
+            op = operation(conn, body)
+            if op[2]:
+                return saved_response(conn, op)
+            work = held(conn, work_id)
+            batch = oss_batch(conn, work)
+            require(batch and body.get('input_manifest_sha256') == work['manifest_hash'], 'OSS 批次与当前领取不符')
+            if batch['delivery'] == 'manual':
+                conn.execute("""UPDATE execution_work SET state='awaiting_manual',stage='awaiting_manual',
+                    lease=NULL,expires=NULL,updated=? WHERE id=?""", (now(),work_id))
+                return saved_response(conn, op, dict(state='awaiting_manual'), 202)
+            size, sha = body.get('size_bytes'), body.get('sha256')
+            require(uint(size,1,MAX_ARTIFACT) and isinstance(sha,str) and SHA.fullmatch(sha),
+                    '需要交付 ZIP 大小和 SHA-256')
+            transfer = identifier('transfer')
+            timestamp = now()
+            conn.execute('INSERT INTO oss_transfers VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                (transfer,None,work_id,work['attempt'],batch['location'],'submission.zip',size,None,'application/zip',
+                 json_text(dict(sha256=sha)),'ready',None,None,timestamp,timestamp))
+            conn.execute("""UPDATE execution_work SET state='verifying',stage='oss_verifying',
+                lease=NULL,expires=NULL,updated=? WHERE id=?""", (timestamp,work_id))
+            return saved_response(conn, op, dict(state='verifying', transfer_id=transfer), 202)
+
+    def create_oss_source(transfer, argument, form=None):
+        if transfer is None:
+            quality = form.get('export_quality', '1080p')
+            mode = form.get('review_mode', LOCAL_REVIEW)
+            mime = VIDEO_TYPES.get(Path(argument).suffix.lower())
+            if not mime or quality not in EXPORT_QUALITIES or mode not in REVIEW_MODES:
+                abort(422, '视频格式、画质或审片存储模式无效')
+            return dict(quality=quality, mode=mode), mime
+        result = argument(dict(kind='source', location=json.loads(transfer['location']),
+                               size_bytes=transfer['size_bytes'], media_type=transfer['media_type']))
+        location = Location(**result['location'])
+        sha = result['sha256']
+        require(SHA.fullmatch(sha), '原片摘要无效')
+        options = json.loads(transfer['options'])
+        with write() as conn:
+            if not conn.execute("SELECT 1 FROM users WHERE id=? AND role='admin' AND enabled=1 AND deleted_at IS NULL",
+                                (transfer['actor'],)).fetchone():
+                raise ValueError('发起上传的管理员当前不可用')
+            old = conn.execute("""SELECT e.job FROM execution_jobs e JOIN execution_artifacts a ON a.id=e.source
+                                  WHERE a.sha256=? ORDER BY e.job LIMIT 1""", (sha,)).fetchone()
+            if old:
+                answer = dict(job=old['job'], reused=True)
+            else:
+                item = save_artifact(conn, identifier('artifact'), 'source_video', sha, transfer['size_bytes'],
+                                     transfer['media_type'], transfer['filename'])
+                conn.execute('INSERT INTO oss_artifacts VALUES(?,?)', (item['artifact_id'],json_text(location.public())))
+                title = Path(transfer['filename']).stem.strip()[:120] or '原片'
+                job = conn.execute('INSERT INTO jobs(title) VALUES(?)',(title,)).lastrowid
+                conn.execute('INSERT INTO execution_jobs(job,actor,source,local_review,export_quality) VALUES(?,?,?,?,?)',
+                             (job,transfer['actor'],item['artifact_id'],options['mode']==LOCAL_REVIEW,options['quality']))
+                enqueue(conn, job_inputs(conn,job), 'prepare', 1)
+                answer = dict(job=job, reused=False)
+            conn.execute("UPDATE oss_transfers SET state='done',result=? WHERE id=?",
+                         (json_text(answer),transfer['id']))
+        return answer
+
+    def verifying_work(conn, transfer):
+        work = work_row(conn, transfer['work'])
+        if work['state'] == 'succeeded' and work['attempt'] == transfer['attempt'] and work['receipt']:
+            return work
+        token = conn.execute('SELECT revoked,paused_at FROM execution_tokens WHERE id=?', (work['token'],)).fetchone()
+        if (work['state'] != 'verifying' or work['attempt'] != transfer['attempt'] or work['deleted_at'] is not None
+                or not token or token['revoked'] is not None or token['paused_at'] is not None):
+            raise ValueError('此领取批次已失效')
+        return work
+
+    def publish_oss_work(transfer, cloud):
+        conn = db()
+        work = verifying_work(conn, transfer)
+        if work['state'] == 'succeeded':
+            return json.loads(work['receipt'])
+        order = json.loads(work['manifest'])
+        inputs = {item['role']: item for item in order['artifacts']}
+        spec = job_inputs(conn, work['job'])
+        assignment = dict(job_id=str(work['job']), work_id=work['id'], attempt=work['attempt'],
+                          input_manifest_sha256=work['manifest_hash'])
+        input_json, input_locations = {}, {}
+        for role in ('source_timeline','version_manifest','approval_manifest'):
+            if role not in inputs:
+                continue
+            item = inputs[role]
+            local = path_for(item)
+            if local.is_file() and local.stat().st_size <= MAX_JSON:
+                input_json[role] = base64.b64encode(local.read_bytes()).decode()
+            else:
+                location = location_for(conn, item['artifact_id'])
+                require(location is not None, f'冻结输入缺少 {role}')
+                input_locations[role] = location.public()
+        response = cloud(dict(kind='submission', location=json.loads(transfer['location']), size_bytes=transfer['size_bytes'],
+                              assignment=assignment, order=order, input_json=input_json, input_locations=input_locations,
+                              work={key:work[key] for key in ('job','kind','target')},
+                              **json.loads(transfer['options'])))
+        outputs = response['outputs']
+
+        def record(conn):
+            fresh = verifying_work(conn,transfer)
+            if fresh['state'] != 'verifying':
+                raise ValueError('工单已经提交')
+            for role,item in outputs.items():
+                location = Location(**response['locations'][role])
+                key = item['artifact_id']
+                save_artifact(conn,key,role,item['sha256'],item['size_bytes'],item['media_type'],role)
+                conn.execute('INSERT INTO oss_artifacts VALUES(?,?)',(key,json_text(location.public())))
+            receipt = completion_receipt(conn,work,outputs)
+            conn.execute("UPDATE oss_transfers SET state='done',result=? WHERE id=?",
+                         (json_text(receipt),transfer['id']))
+            return receipt
+
+        if work['kind'] == 'finalize':
+            with write() as conn:
+                receipt = record(conn)
+                conn.execute('INSERT INTO execution_deliveries VALUES(?,?,?)',(work['job'],work['target'],json_text(outputs)))
+            return receipt
+
+        version = response['version']
+        frames = [Frame(**frame) for frame in response['frames']]
+        timeline = outputs.get('source_timeline') or inputs['source_timeline']
+        receipt = None
+
+        def publish(conn, version_id, number):
+            nonlocal receipt
+            require(number == work['target'], '审核版本号已变化')
+            receipt = record(conn)
+            conn.execute('INSERT INTO execution_versions VALUES(?,?,?)',
+                         (work['job'],number,json_text(outputs | {'source_timeline': timeline})))
+            for frame in frames:
+                location = Location(**response['frame_locations'][str(frame.number)])
+                conn.execute('INSERT INTO oss_frames VALUES(?,?,?)',(version_id,frame.number,json_text(location.public())))
+            if conn.execute("SELECT 1 FROM versions WHERE id=? AND state='approved'",(version_id,)).fetchone():
+                after_review(conn,work['job'],version_id,'finalize')
+
+        # Keep the small version manifest locally for transactional approval and export checks.
+        version_item = outputs['version_manifest']
+        version_path = path_for(version_item)
+        if not version_path.exists():
+            encoded = base64.b64decode(response['version_bytes'], validate=True)
+            require(len(encoded) <= MAX_JSON and hashlib.sha256(encoded).hexdigest() == version_item['sha256'],
+                    '云端返回的版本清单摘要无效')
+            version_path.write_bytes(encoded)
+        try:
+            import_version(None,work['job'],spec['title'],spec['actor'],
+                           None if work['kind']=='prepare' else work['target']-1,channel='execution',
+                           publish=publish,check=lambda conn: verifying_work(conn,transfer),
+                           inherit_only=approved_frames(work,inputs,version),
+                           stage_frames=lambda _: (response['source_hash'],frames),
+                           package_hash=outputs['review_bundle']['sha256'])
+        except BaseException:
+            if not db().execute('SELECT 1 FROM execution_artifacts WHERE id=?',(version_item['artifact_id'],)).fetchone():
+                version_path.unlink(missing_ok=True)
+            raise
+        return receipt
+
+    @admin.post('/admin/execution/devices/<node>/oss-delivery')
+    @requires('admin')
+    def set_oss_delivery(node):
+        if not request.is_secure and not app.config.get('EXECUTION_TEST_HTTP'):
+            abort(403, '请通过 HTTPS 管理设备交付方式')
+        mode = request.form.get('oss_delivery')
+        if mode not in ('auto','manual'):
+            abort(422, '请选择设备交付方式')
+        with write() as conn:
+            assert_session('admin')
+            if not conn.execute('UPDATE execution_nodes SET oss_delivery=? WHERE id=? AND deleted_at IS NULL',
+                                (mode,node)).rowcount:
+                abort(404, '设备不存在')
+        flash('交付方式已保存，从下次领取生效。','success')
+        return redirect(url_for('execution.panel',_anchor=node),code=303)
+
+    @admin.get('/admin/execution/jobs/<int:job>/source')
+    @requires('admin')
+    def source_video(job):
+        spec = job_inputs(db(), job)
+        if not spec:
+            abort(404)
+        item = artifact(db(),spec['source'])
+        location = location_for(db(),item['artifact_id'])
+        if location:
+            return redirect(location.url, code=302)
+        return send_file(path_for(item),mimetype=item['media_type'],conditional=True,etag=item['sha256'])
 
     @admin.get('/admin/execution')
     @requires('admin')
@@ -1006,7 +1257,10 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                     flash(f'设备「{name}」已登记。如需更换密钥，请在密钥页选择这台设备。', 'error')
                     return redirect(url_for('execution.panel', _anchor='devices'), code=303)
                 node = identifier('node')
-                conn.execute('INSERT INTO execution_nodes(id,name) VALUES(?,?)',(node,name))
+                mode = request.form.get('oss_delivery', 'manual')
+                if mode not in ('auto','manual'):
+                    abort(422, '请选择设备交付方式')
+                conn.execute('INSERT INTO execution_nodes(id,name,oss_delivery) VALUES(?,?,?)',(node,name,mode))
             elif not conn.execute('SELECT 1 FROM execution_nodes WHERE id=? AND deleted_at IS NULL',(node,)).fetchone():
                 abort(404,'设备不存在')
             secret = issue(conn,node,days)
@@ -1104,7 +1358,7 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
     @requires('admin')
     def create_job():
         quality = request.form.get('export_quality', '1080p')
-        review_mode = request.form.get('review_mode', 'central')
+        review_mode = request.form.get('review_mode', LOCAL_REVIEW)
         if quality not in EXPORT_QUALITIES or review_mode not in REVIEW_MODES:
             abort(422, '成片质量或审片存储模式无效')
         with tempfile.TemporaryDirectory(dir=parts_dir) as folder:
@@ -1221,7 +1475,7 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
             if expected != last['state'] and not (action == 'return' and expected == 'leased' and last['state'] == 'failed'):
                 abort(409,'工单已更新，请刷新后再操作')
             if action == 'return':
-                if old != 'active' or last['state'] not in ('leased','failed') or last['node'] is None:
+                if old != 'active' or last['state'] not in ('leased','failed','awaiting_manual','verifying') or last['node'] is None:
                     abort(409,'只能退回已领取且未完成的活动工单')
                 returned = now()
                 conn.execute('''UPDATE execution_attempts SET returned_at=?,returned_by=?,return_reason=?
@@ -1279,9 +1533,13 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
         item = json.loads(row['artifacts']).get(role) if row else None
         if not item:
             abort(404)
+        location = location_for(db(), item['artifact_id'])
+        if location:
+            return redirect(fetch_url(location), code=302)
         return send_file(path_for(item),mimetype=item['media_type'],conditional=True,etag=item['sha256'],
                          as_attachment=role=='delivery_bundle',download_name=role+('.zip' if role=='delivery_bundle' else '.mp4'))
 
+    processor_ready = setup_oss(app, db, write, requires, assert_session, create_oss_source, publish_oss_work, manual_batch)
     app.register_blueprint(admin)
     app.register_blueprint(machine)
-    return after_review, apply_control
+    return after_review, apply_control, fetch_url

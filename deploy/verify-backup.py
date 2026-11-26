@@ -15,15 +15,21 @@ def verify(state):
         if db.execute('PRAGMA foreign_key_check').fetchone() is not None:
             raise ValueError('SQLite foreign key check failed')
         assets = state / 'assets'
+        tables = {name for name, in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         frames = 0
-        for folder, file in db.execute('''SELECT v.asset_dir, f.asset_name FROM frames f
-                                          JOIN versions v ON v.id=f.version_id'''):
+        frame_query = 'SELECT v.asset_dir,f.asset_name FROM frames f JOIN versions v ON v.id=f.version_id'
+        if 'oss_frames' in tables:
+            frame_query += ' WHERE NOT EXISTS(SELECT 1 FROM oss_frames o WHERE o.version_id=f.version_id AND o.number=f.number)'
+        for folder, file in db.execute(frame_query):
             path = assets / folder / file
             if not path.is_file() or path.stat().st_size == 0:
                 raise ValueError(f'Frame asset missing: {folder}/{file}')
             frames += 1
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_artifacts'").fetchone():
-            for key, size, checksum in db.execute('SELECT id,size_bytes,sha256 FROM execution_artifacts'):
+            artifact_query = 'SELECT id,size_bytes,sha256 FROM execution_artifacts a'
+            if 'oss_artifacts' in tables:
+                artifact_query += " WHERE a.role='version_manifest' OR NOT EXISTS(SELECT 1 FROM oss_artifacts o WHERE o.artifact=a.id)"
+            for key, size, checksum in db.execute(artifact_query):
                 path = assets / 'execution' / key
                 if not path.is_file() or path.stat().st_size != size:
                     raise ValueError(f'Execution artifact missing or truncated: {key}')
