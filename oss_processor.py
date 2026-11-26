@@ -14,8 +14,8 @@ import requests
 from flask import Flask, abort, jsonify, request
 
 from execution import OUTPUTS, ROLE_TYPES, identifier, validate_delivery
-from execution_artifacts import (MAX_ARTIFACT, MAX_JSON, SHA, bundle, check_entries, file_hash,
-                                 frame_size, json_object, read_json, require, stage_review_frames)
+from execution_artifacts import (MAX_ARTIFACT, MAX_JSON, REJECTED_FRAMES_MODE, SHA, bundle, check_entries, file_hash,
+                                 frame_size, json_object, materialize_review_delta, read_json, require, stage_review_frames)
 from oss_storage import PREFIX, Location, cloud_bucket
 
 
@@ -116,6 +116,8 @@ def validate_submission(location, folder, task, run):
                 and ticks['source_sha256'] == expected['source_sha256'], '送审版本与冻结工单或产物不一致')
         storage = order.get('review_storage')
         require(version.get('review_storage') == storage, '送审版本与审片存储模式不一致')
+        incremental = order.get('review_upload') == REJECTED_FRAMES_MODE
+        require(('review_delta' in version) == incremental, '审核包的上传模式与工单不符')
         if storage:
             require(all(isinstance(version.get(key), str) and SHA.fullmatch(version[key])
                         for key in ('scene_sha256','scene_bundle_sha256')), '本机工程摘要无效')
@@ -129,7 +131,24 @@ def validate_submission(location, folder, task, run):
         frame_size(version['final_size'])
         destination = folder / 'frames'
         destination.mkdir()
-        source, frames = stage_review_frames(path_for, outputs, ticks, version, destination)
+        review = path_for(outputs['review_bundle'])
+        if incremental:
+            previous = task['base_review']
+            base_item = previous['item']
+            base_zip = folder / 'base-review.zip'
+            fetch(Location(**previous['location']),base_zip,base_item['size_bytes'],base_item['sha256'])
+            merged = folder / 'merged-review.zip'
+            materialize_review_delta(review,base_zip,merged,version,read_json(input_file('version_manifest')),
+                                     read_json(input_file('feedback_manifest')),inputs['version_manifest']['sha256'])
+            base_zip.unlink()
+            review = merged
+        source, frames = stage_review_frames(review, ticks, version, destination)
+        if incremental:
+            item = dict(artifact_id=identifier('artifact'), role='review_bundle', size_bytes=review.stat().st_size,
+                        sha256=file_hash(review), media_type='application/zip')
+            ref = output_location(location,run,'artifacts/' + item['artifact_id'])
+            publish(ref,review,item['media_type'])
+            result['full_review'] = dict(item=item,location=ref.public())
         def publish_frame(frame):
             ref = output_location(location, run, 'frames/' + frame.asset_name)
             publish(ref, destination / frame.asset_name, frame.mimetype)

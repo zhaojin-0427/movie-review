@@ -2,7 +2,7 @@
 
 ## 注册和领单
 
-- 保留设备 Token、节点标识、实例 ID、心跳和领取接口。支持 OSS 交付的版本在 `POST /api/v1/workers/register` 的 `capabilities` 增加布尔值 `oss_delivery: true`。升级后发起新的注册。支持同机审片时继续发送 `X-Film-Worker-Review-Storage: node_local_v1`。
+- 保留设备 Token、节点标识、实例 ID、心跳和领取接口。支持 OSS 交付的版本在 `POST /api/v1/workers/register` 的 `capabilities` 增加布尔值 `oss_delivery: true`。升级后发起新的注册。支持同机审片时继续发送 `X-Film-Worker-Review-Storage: node_local_v1`。支持增量返修时同时发送 `X-Film-Worker-Review-Upload: rejected_frames_v1`。
 - `POST /api/v1/work/claim` 可能在原有字段之外返回 `oss`。缺少 `oss` 时继续走现有下载和上传协议。
 - 有 `oss` 时从 `oss.source_url` 直接下载原片，仍与冻结输入中 `source_video.sha256`、`size_bytes` 对比。下载请求无需设备 Token 或 OSS 凭据。
 - 其他冻结输入仍从原有 `/api/v1/artifacts/{artifact_id}/content` 获取。若收到 302，则向 `Location` 发起新的 GET。设备 Token 和工单租约头只发给 247。校验工件大小与摘要。
@@ -32,7 +32,7 @@
 ```
 
 - 首版 `prepare` 包含示例中的五项。返修 `revise` 沿用基版的时间线，省去 `source_timeline`。
-- 集中存储的首版和返修另含 `scene_bundle`。同机审片的内层 `review.zip` 含原有索引和全帧对比 JPG，工程和无损白模帧留在领取该作业的实例。返修仍提交全帧对比图。
+- 集中存储的首版和返修另含 `scene_bundle`。同机审片的内层 `review.zip` 含原有索引和全帧对比 JPG，工程和无损白模帧留在领取该作业的实例。如果领取清单包含 `review_upload: rejected_frames_v1`，内层审核 ZIP 只上传被打回帧，按既有增量协议提交 `review_delta` 和完整版本清单，云端从基版补齐其余帧。未声明时返修提交全帧。
 - 出片 `finalize` 的 `outputs` 包含 `white_video`、`comparison_video`、`delivery_bundle`。把原有出片请求的 `final_verification` 放在 `submission.json` 顶层，原字段及摘要照旧。
 - 外层每个产物角色有一个独立文件。ZIP 中只能放索引与其列出的产物。版本 JSON、审核 ZIP 索引、时间线和交付 ZIP 的现有校验规则照旧。
 - 工单退回待领后，新领取批次会有新目录及 `attempt`，重新生成交付包并使用新批次。保留本机同机审片的工程与历史产物供后续返修、出片使用。

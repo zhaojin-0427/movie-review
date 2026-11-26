@@ -2,6 +2,7 @@
 import hashlib
 import json
 import re
+import shutil
 import stat
 import unicodedata
 from pathlib import PurePosixPath
@@ -13,6 +14,7 @@ from packages import MAX_FRAME, MAX_FRAMES, read_timeline, save_frame
 SHA = re.compile(r'[a-f0-9]{64}\Z')
 MAX_ARTIFACT = 16 * 1024**3
 MAX_JSON = 16 * 1024**2
+REJECTED_FRAMES_MODE = 'rejected_frames_v1'
 
 
 def json_object(data):
@@ -107,7 +109,69 @@ def frame_size(value):
     return width, height
 
 
-def stage_review_frames(path_for, outputs, timeline, version, destination):
+def review_index_matches(index, version):
+    fields = ('job_id', 'source_sha256', 'timeline_sha256', 'review_size', 'final_size', 'frames')
+    require(all(index.get(key) == version[key] for key in fields), '审核包索引与版本清单不符')
+    require(index.get('review_storage') == version.get('review_storage'), '审核包索引的审片存储模式不符')
+
+
+def materialize_review_delta(path, base_path, destination, version, base, feedback, base_hash):
+    delta = version['review_delta']
+    rejected = delta['frames']
+    require(isinstance(rejected, list) and rejected and all(type(n) is int for n in rejected)
+            and rejected == sorted({f['number'] for f in feedback['frames']})
+            and delta == dict(mode=REJECTED_FRAMES_MODE, base_version=base['version'], base_manifest_sha256=base_hash,
+                              frames=rejected, full_files_sha256=delta['full_files_sha256'])
+            and SHA.fullmatch(delta['full_files_sha256']), '增量帧或基版与冻结返修意见不匹配')
+    frames, prior = version['frames'], base['frames']
+    require(len(frames) == len(prior) and all(1 <= n <= len(frames) for n in rejected)
+            and all(version[key] == base[key] for key in ('job_id', 'source_sha256', 'timeline_sha256',
+                                                         'review_size', 'final_size'))
+            and version.get('review_storage') == base.get('review_storage'), '增量审核包的基版或画幅不匹配')
+    rejected = set(rejected)
+    roles = ('pair_jpeg_path',) if version.get('review_storage') else ('pair_jpeg_path', 'white_png_path')
+    changed, inherited = set(), set()
+    for number, (frame, previous) in enumerate(zip(frames, prior, strict=True), 1):
+        if number in rejected:
+            changed.update(frame[role] for role in roles)
+        else:
+            require(frame == previous, '增量审核包改动了打回范围外的帧')
+            inherited.update(frame[role] for role in roles)
+
+    def merge(archive, files, index):
+        review_index_matches(index, version)
+        require(index.get('review_delta') == delta and index.get('target_version') == version['version']
+                and index.get('scene_sha256') == version['scene_sha256']
+                and files.keys() == changed and len(archive.infolist()) == len(changed) + 1,
+                '增量审核包文件、索引或工程摘要不符')
+
+        def copy_frames(previous_archive, previous_files, previous_index):
+            review_index_matches(previous_index, base)
+            require('review_delta' not in previous_index and inherited <= previous_files.keys()
+                    and not changed & inherited, '基版全帧审核包缺失或有路径冲突')
+            frozen = {item['path']: item for item in previous_index['files']}
+            if base.get('review_delta'):
+                require(object_hash([frozen[name] for name in sorted(frozen)]) == base['review_delta']['full_files_sha256'],
+                        '基版审核包文件索引摘要不匹配')
+            full_files = sorted(index['files'] + [frozen[name] for name in inherited], key=lambda f: f['path'])
+            require(sum(f['size_bytes'] for f in full_files) <= MAX_ARTIFACT
+                    and object_hash(full_files) == delta['full_files_sha256'], '合并后的审核包文件摘要或大小不符')
+            full_index = dict(index, files=full_files)
+            del full_index['review_delta']
+            with ZipFile(destination, 'x') as merged:
+                merged.writestr('index.json', json.dumps(full_index, ensure_ascii=False).encode())
+                for item in full_files:
+                    name = item['path']
+                    source = archive if name in changed else previous_archive
+                    with source.open(name) as src, merged.open(name, 'w', force_zip64=True) as dst:
+                        shutil.copyfileobj(src, dst, 1024 * 1024)
+
+        bundle(base_path, copy_frames)
+
+    bundle(path, merge)
+
+
+def stage_review_frames(path, timeline, version, destination):
     frames = version['frames']
     ticks = [frame['pts'] for frame in timeline['frames']]
     count = len(frames)
@@ -122,9 +186,8 @@ def stage_review_frames(path_for, outputs, timeline, version, destination):
         require(width <= limit[0] and height <= limit[1], '同机审片图超过 1080p 范围')
 
     def convert(archive, files, index):
-        fields = ('job_id', 'source_sha256', 'timeline_sha256', 'review_size', 'final_size', 'frames')
-        require(all(index.get(key) == version[key] for key in fields), '审核包索引与版本清单不符')
-        require(index.get('review_storage') == storage, '审核包索引的审片存储模式不符')
+        review_index_matches(index, version)
+        require('review_delta' not in index, '审核包须先合并为完整版本')
         if storage:
             require(index.get('target_version') == version['version'] and index.get('scene_sha256') == version['scene_sha256']
                     and len(archive.infolist()) == len(files) + 1, '同机审片索引的版号、工程摘要或文件列表无效')
@@ -158,4 +221,4 @@ def stage_review_frames(path_for, outputs, timeline, version, destination):
         require(used == files.keys(), '审核包含额外文件')
         return source_hash, staged
 
-    return bundle(path_for(outputs['review_bundle']), convert)
+    return bundle(path, convert)

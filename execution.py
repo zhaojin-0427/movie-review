@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import time
 import unicodedata
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from fractions import Fraction
 from pathlib import Path
@@ -17,18 +18,19 @@ from uuid import UUID
 from flask import Blueprint, abort, flash, g, jsonify, redirect, render_template, request, send_file, url_for
 from werkzeug.exceptions import HTTPException
 
+from execution_artifacts import (MAX_ARTIFACT, MAX_JSON, REJECTED_FRAMES_MODE, SHA, bundle, canonical,
+                                 file_hash, frame_size, json_object, materialize_review_delta, object_hash, read_json,
+                                 require, stage_review_frames)
 from oss_storage import PREFIX, URL_SECONDS, Location, platform_bucket, settings
 from oss_workflow import setup_oss
 from packages import Frame
-
-from execution_artifacts import (MAX_ARTIFACT, MAX_JSON, SHA, bundle, canonical, file_hash, frame_size,
-                                 json_object, object_hash, read_json, require, stage_review_frames)
 
 PART_SIZE = 8388608
 LEASE_SECONDS = 90
 ONLINE_SECONDS = 100
 LOCAL_REVIEW = 'node_local_v1'
 REVIEW_STORAGE_HEADER = 'X-Film-Worker-Review-Storage'
+REVIEW_UPLOAD_HEADER = 'X-Film-Worker-Review-Upload'
 REVIEW_MODES = {'central': '集中存储', LOCAL_REVIEW: '同机审片'}
 EXPORT_QUALITIES = {'1080p': '1080p', '4k': '4K'}
 KINDS = {'prepare': '首版', 'revise': '返修', 'finalize': '出片'}
@@ -400,7 +402,9 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
     def register():
         body = payload()
         review_mode = request.headers.get(REVIEW_STORAGE_HEADER)
+        upload_mode = request.headers.get(REVIEW_UPLOAD_HEADER)
         require(review_mode in (None, LOCAL_REVIEW), '不支持的审片存储模式')
+        require(upload_mode in (None, REJECTED_FRAMES_MODE), '不支持的审片上传模式')
         if body.get('node_key') != g.node:
             problem(403, 'forbidden', '设备标识与密钥不匹配')
         try:
@@ -424,6 +428,8 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                 cap['oss_delivery'] = True
             if review_mode:
                 cap['review_storage'] = review_mode
+            if upload_mode:
+                cap['review_upload'] = upload_mode
         except (KeyError, TypeError, AttributeError) as error:
             raise ValueError('节点注册字段不完整') from error
         with write() as conn:
@@ -441,7 +447,8 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                 if node['instance'] != instance:
                     problem(409, 'worker_unknown', '注册实例已被替换')
                 previous = json.loads(node['capabilities'])
-                if any(previous.get(key) != cap.get(key) for key in ('review_storage','oss_delivery')):
+                if any(previous.get(key) != cap.get(key)
+                       for key in ('review_storage','review_upload','oss_delivery')):
                     conn.execute('UPDATE execution_nodes SET capabilities=? WHERE id=?', (json_text(cap), g.node))
                 response = saved_response(conn,op)
                 response[0].headers['X-Film-Worker-Storage'] = '1'
@@ -456,6 +463,16 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
     def accepts(node):
         return (not node['draining'] and node['seen'] > now() - ONLINE_SECONDS and node['slots'] > 0
                 and (node['disk_free'] is None or node['disk_free'] >= node['disk_reserve']))
+
+    def supports_review_inputs(manifest, capabilities):
+        if capabilities.get('review_upload') == REJECTED_FRAMES_MODE:
+            return True
+        if manifest.get('review_upload'):
+            return False
+        if manifest['kind'] == 'prepare':
+            return True
+        base = next(item for item in manifest['artifacts'] if item['role'] == 'version_manifest')
+        return 'review_delta' not in read_json(path_for(base))
 
     @machine.post('/workers/<worker>/heartbeat')
     def heartbeat(worker):
@@ -490,17 +507,19 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                 node = get_node(conn, body.get('worker_id'), body.get('instance_id'))
                 op = operation(conn, body)
                 expire_leases(conn)
+                cap = json.loads(node['capabilities'])
                 if op[2]:
                     if op[2]['status'] == 200:
                         prior = json.loads(op[2]['response'])
                         current = work_row(conn, prior['work_id'])
                         local = prior['input_manifest'].get('review_storage')
                         if (current['state'] != 'leased' or current['lease'] != prior['lease']['lease_id']
+                                or (prior.get('oss') and not cap.get('oss_delivery'))
+                                or not supports_review_inputs(prior['input_manifest'], cap)
                                 or (local and (local['instance_id'] != node['instance']
-                                    or json.loads(node['capabilities']).get('review_storage') != LOCAL_REVIEW))):
+                                    or cap.get('review_storage') != LOCAL_REVIEW))):
                             return '', 204, {'Retry-After': '3'}
                     return saved_response(conn, op)
-                cap = json.loads(node['capabilities'])
                 active = conn.execute("SELECT count(*) FROM execution_work WHERE node=? AND state='leased'", (g.node,)).fetchone()[0]
                 if accepts(node) and active < cap['slots']:
                     rows = conn.execute('''SELECT w.*,e.local_review,e.review_node,e.review_instance
@@ -512,6 +531,8 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                         if row['kind'] not in kinds or row['kind'] not in cap['work_kinds']:
                             continue
                         manifest = json.loads(row['manifest'])
+                        if not supports_review_inputs(manifest, cap):
+                            continue
                         source_id = next(item['artifact_id'] for item in manifest['artifacts'] if item['role'] == 'source_video')
                         source_location = location_for(conn, source_id)
                         if source_location and (not cap.get('oss_delivery') or not processor_ready or not settings(conn)):
@@ -533,6 +554,8 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                             native = read_json(path_for(item))['final_size']
                             if export_size(native, '1080p') != native:
                                 continue
+                        if row['kind'] == 'revise' and row['attempt'] == 0 and cap.get('review_upload') == REJECTED_FRAMES_MODE:
+                            manifest['review_upload'] = REJECTED_FRAMES_MODE
                         claimed = now()
                         attempt, lease, expires = row['attempt'] + 1, identifier('lease'), claimed + LEASE_SECONDS
                         digest = object_hash(manifest)
@@ -570,10 +593,14 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
         token = conn.execute('SELECT revoked,paused_at,expires FROM execution_tokens WHERE id=?', (row['token'],)).fetchone()
         if token['revoked'] is not None or token['paused_at'] is not None or token['expires'] <= now():
             problem(409, 'lease_lost', '签发工单的设备密钥已失效')
-        if json.loads(row['manifest']).get('review_storage'):
+        manifest = json.loads(row['manifest'])
+        if manifest.get('review_storage') or manifest.get('review_upload'):
             node = get_node(conn, g.node, row['instance'])
-            if json.loads(node['capabilities']).get('review_storage') != LOCAL_REVIEW:
+            cap = json.loads(node['capabilities'])
+            if manifest.get('review_storage') and cap.get('review_storage') != LOCAL_REVIEW:
                 problem(409, 'lease_lost', '此工单需要支持同机审片的原执行实例')
+            if manifest.get('review_upload') and cap.get('review_upload') != REJECTED_FRAMES_MODE:
+                problem(409, 'lease_lost', '此工单需要支持增量返修的执行端')
         return row
 
     def output_roles(work, manifest):
@@ -634,7 +661,7 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
             problem(404, 'artifact_not_found', '该工件不在当前工单的冻结输入中')
         item = permitted[key]
         location = location_for(conn, key)
-        if location:
+        if location and item['role'] != 'version_manifest':
             return redirect(location.url if item['role'] == 'source_video' else fetch_url(location), code=302)
         return send_file(path_for(item), mimetype=item['media_type'], conditional=True, etag=item['sha256'])
 
@@ -821,6 +848,8 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                     '送审版本与原片、时间线、产物或工单不一致')
             storage = order.get('review_storage')
             require(version.get('review_storage') == storage, '送审版本与工单的审片存储模式不一致')
+            incremental = order.get('review_upload') == REJECTED_FRAMES_MODE
+            require(('review_delta' in version) == incremental, '审核包的上传模式与工单不符')
             if storage:
                 require(all(isinstance(version.get(key),str) and SHA.fullmatch(version[key])
                             for key in ('scene_sha256','scene_bundle_sha256')), '本机工程摘要无效')
@@ -836,28 +865,55 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
             inactive_base = None if work['kind'] == 'prepare' else work['target'] - 1
 
             def publish(conn, version_id, number):
-                nonlocal result
+                nonlocal result, saved_full
                 fresh = held(conn,work_id)
                 require(number == work['target'], '审核版本号已变化')
+                recorded = outputs | {'source_timeline': timeline_item}
+                if incremental:
+                    full = store(conn, merged, 'review_bundle', ROLE_TYPES['review_bundle'], 'review-full.zip', merged_hash)
+                    saved_full = path_for(full)
+                    recorded['review_bundle'] = full
                 conn.execute('INSERT INTO execution_versions VALUES(?,?,?)',
-                             (work['job'],number,json_text(outputs | {'source_timeline':timeline_item})))
+                              (work['job'],number,json_text(recorded)))
                 result = finish(conn,fresh,operation(conn,body),outputs)
                 if conn.execute("SELECT 1 FROM versions WHERE id=? AND state='approved'",(version_id,)).fetchone():
                     after_review(conn,work['job'],version_id,'finalize')
 
             result = None
+            saved_full = None
             review_bundle = outputs['review_bundle']
             # The client can retry before a large package finishes decoding. Share
             # the lock across server processes without blocking work heartbeats.
-            with path_for(review_bundle).open('rb') as sealed:
+            review_path = path_for(review_bundle)
+            with review_path.open('rb') as sealed, ExitStack() as cleanup:
                 try:
                     fcntl.flock(sealed, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     problem(503, 'review_import_in_progress', '审核包正在入库，请稍后重试')
-                import_version(None, work['job'], spec['title'], spec['actor'], inactive_base, channel='execution',
-                               publish=publish, check=lambda conn: held(conn,work_id), inherit_only=permitted,
-                               stage_frames=lambda destination: stage_review_frames(path_for, outputs, timeline, version, destination),
-                               package_hash=review_bundle['sha256'])
+                merged = review_path
+                if incremental:
+                    saved = conn.execute('SELECT artifacts FROM execution_versions WHERE job=? AND version=?',
+                                         (work['job'], order['base_version'])).fetchone()
+                    require(saved is not None, '增量审核包缺少冻结的基版')
+                    base_items = json.loads(saved['artifacts'])
+                    base_item = inputs['version_manifest']
+                    require(base_items['version_manifest'] == base_item, '增量审核包的基版清单已变化')
+                    base = read_json(path_for(base_item))
+                    feedback = read_json(path_for(inputs['feedback_manifest']))
+                    folder = cleanup.enter_context(tempfile.TemporaryDirectory(prefix='review-merge-', dir=data))
+                    merged = Path(folder) / 'review.zip'
+                    materialize_review_delta(review_path, path_for(base_items['review_bundle']), merged,
+                                              version, base, feedback, base_item['sha256'])
+                    merged_hash = file_hash(merged)
+                try:
+                    import_version(None, work['job'], spec['title'], spec['actor'], inactive_base, channel='execution',
+                                   publish=publish, check=lambda conn: held(conn,work_id), inherit_only=permitted,
+                                   stage_frames=lambda destination: stage_review_frames(merged, timeline, version, destination),
+                                   package_hash=review_bundle['sha256'])
+                except BaseException:
+                    if saved_full is not None:
+                        saved_full.unlink(missing_ok=True)
+                    raise
             return result
         except (KeyError, TypeError, IndexError, UnicodeError, RecursionError, OSError) as error:
             raise ValueError('产物清单缺失必需字段或格式错误') from error
@@ -1077,7 +1133,7 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
         assignment = dict(job_id=str(work['job']), work_id=work['id'], attempt=work['attempt'],
                           input_manifest_sha256=work['manifest_hash'])
         input_json, input_locations = {}, {}
-        for role in ('source_timeline','version_manifest','approval_manifest'):
+        for role in ('source_timeline','version_manifest','approval_manifest','feedback_manifest'):
             if role not in inputs:
                 continue
             item = inputs[role]
@@ -1088,21 +1144,35 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                 location = location_for(conn, item['artifact_id'])
                 require(location is not None, f'冻结输入缺少 {role}')
                 input_locations[role] = location.public()
-        response = cloud(dict(kind='submission', location=json.loads(transfer['location']), size_bytes=transfer['size_bytes'],
-                              assignment=assignment, order=order, input_json=input_json, input_locations=input_locations,
-                              work={key:work[key] for key in ('job','kind','target')},
-                              **json.loads(transfer['options'])))
+        task = dict(kind='submission', location=json.loads(transfer['location']), size_bytes=transfer['size_bytes'],
+                    assignment=assignment, order=order, input_json=input_json, input_locations=input_locations,
+                    work={key:work[key] for key in ('job','kind','target')}, **json.loads(transfer['options']))
+        if order.get('review_upload') == REJECTED_FRAMES_MODE:
+            saved = conn.execute('SELECT artifacts FROM execution_versions WHERE job=? AND version=?',
+                                 (work['job'],order['base_version'])).fetchone()
+            require(saved is not None, '增量审核包缺少冻结的基版')
+            previous = json.loads(saved['artifacts'])
+            item = previous['review_bundle']
+            location = location_for(conn,item['artifact_id'])
+            require(previous['version_manifest'] == inputs['version_manifest'] and location is not None,
+                    '增量审核包的基版不可用')
+            task['base_review'] = dict(item=item, location=location.public())
+        response = cloud(task)
         outputs = response['outputs']
+
+        def save_cloud_artifact(conn, item, location):
+            ref = Location(**location)
+            key = item['artifact_id']
+            role = item['role']
+            save_artifact(conn,key,role,item['sha256'],item['size_bytes'],item['media_type'],role)
+            conn.execute('INSERT INTO oss_artifacts VALUES(?,?)',(key,json_text(ref.public())))
 
         def record(conn):
             fresh = verifying_work(conn,transfer)
             if fresh['state'] != 'verifying':
                 raise ValueError('工单已经提交')
             for role,item in outputs.items():
-                location = Location(**response['locations'][role])
-                key = item['artifact_id']
-                save_artifact(conn,key,role,item['sha256'],item['size_bytes'],item['media_type'],role)
-                conn.execute('INSERT INTO oss_artifacts VALUES(?,?)',(key,json_text(location.public())))
+                save_cloud_artifact(conn,item,response['locations'][role])
             receipt = completion_receipt(conn,work,outputs)
             conn.execute("UPDATE oss_transfers SET state='done',result=? WHERE id=?",
                          (json_text(receipt),transfer['id']))
@@ -1123,8 +1193,12 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
             nonlocal receipt
             require(number == work['target'], '审核版本号已变化')
             receipt = record(conn)
+            recorded = outputs | {'source_timeline': timeline}
+            if full := response.get('full_review'):
+                save_cloud_artifact(conn,full['item'],full['location'])
+                recorded['review_bundle'] = full['item']
             conn.execute('INSERT INTO execution_versions VALUES(?,?,?)',
-                         (work['job'],number,json_text(outputs | {'source_timeline': timeline})))
+                         (work['job'],number,json_text(recorded)))
             for frame in frames:
                 location = Location(**response['frame_locations'][str(frame.number)])
                 conn.execute('INSERT INTO oss_frames VALUES(?,?,?)',(version_id,frame.number,json_text(location.public())))

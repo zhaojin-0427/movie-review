@@ -12,7 +12,7 @@
 
 ## 北京云端校验进程
 
-在与 Bucket 同地域的云主机上安装此版本与 `requirements.txt`。为处理单个最大 16 GiB 的交付包，临时目录应留出至少 50 GiB，内存按实际图像尺寸配置。对外以 HTTPS 反向代理静态路径 `/process`，允许最多 48 MiB 请求及最多两小时的处理连接。接口请求体只包含清单和对象位置。
+在与 Bucket 同地域的云主机上安装此版本与 `requirements.txt`。为处理单个最大 16 GiB 的交付包，临时目录应留出至少 72 GiB，内存按实际图像尺寸配置。对外以 HTTPS 反向代理静态路径 `/process`，允许最多 48 MiB 请求及最多两小时的处理连接。接口请求体只包含清单和对象位置。
 
 设置 `MOVIE_REVIEW_OSS_PROCESSOR_TOKEN` 为随机共享密钥，并在 247 使用同一个值。云端使用 ECS 角色时设置 `OSS_ECS_ROLE`，或通过部署环境注入 `OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET` 和可选的 `OSS_SESSION_TOKEN`。部署时默认通过 OSS 内网访问对象。测试环境可使用 `OSS_INTERNAL=0`。
 
