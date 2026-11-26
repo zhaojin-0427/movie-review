@@ -146,6 +146,7 @@ def create_app(config=None):
                                    "review_node TEXT REFERENCES execution_nodes(id)", "review_instance TEXT",
                                    "export_quality TEXT CHECK (export_quality IN ('1080p','4k'))"),
                 "execution_work": ("deleted_at INTEGER",),
+                "oss_settings": ("direct_upload INTEGER NOT NULL DEFAULT 0",),
                 "execution_tokens": ("paused_at INTEGER", "deleted_at INTEGER"),
                 "execution_attempts": ("claimed_at INTEGER", "returned_at INTEGER",
                                        "returned_by INTEGER REFERENCES users(id)", "return_reason TEXT"),
@@ -239,6 +240,8 @@ def create_app(config=None):
             return
         g.user = session_user()
         if request.method == "POST":
+            if request.endpoint == 'oss.finish_objects':
+                request.max_form_memory_size = 2 * 1024**2
             token = request.form.get("csrf", "")
             if not token or not secrets.compare_digest(token.encode(), session.get("csrf", "").encode()):
                 abort(400, "页面会话已变化，请刷新后重试")

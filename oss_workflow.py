@@ -15,7 +15,8 @@ from flask.cli import with_appcontext
 from werkzeug.exceptions import HTTPException
 
 from execution_artifacts import MAX_ARTIFACT, json_object
-from oss_storage import BUCKET, PART_BYTES, PREFIX, REGION, URL_SECONDS, Location, cipher, platform_bucket, settings
+from oss_objects import HASH_HEADER, confirm_object, declaration, declarations, file_type
+from oss_storage import OBJECTS, BUCKET, PART_BYTES, PREFIX, REGION, URL_SECONDS, Location, cipher, platform_bucket, settings
 
 
 class ProcessorUnavailable(Exception):
@@ -40,14 +41,15 @@ def setup_oss(app, db, write, requires, assert_session, create_source, publish_w
 
     def live_settings():
         config = settings(db())
-        if not config or not processor_ready:
-            abort(409, '请先完成 OSS 设置和云端校验服务配置')
+        if not config:
+            abort(409, '请先完成 OSS 设置')
         return config
 
     def view_settings(config, message=None, status=200):
         # Pass only the fields that the template may show.
         current = dict(region=config['region'], source_bucket=config['source_bucket'],
-                       review_bucket=config['review_bucket'], masked_key='••••' + config['access_key_id'][-4:]) if config else {}
+                       review_bucket=config['review_bucket'], masked_key='••••' + config['access_key_id'][-4:],
+                       direct_upload=bool(config['direct_upload'])) if config else dict(direct_upload=True)
         return render_template('oss_settings.html', config=current, processor_ready=processor_ready,
                                message=message), status
 
@@ -67,6 +69,10 @@ def setup_oss(app, db, write, requires, assert_session, create_source, publish_w
         review = request.form.get('review_bucket', '').strip()
         key = request.form.get('access_key_id', '').strip()
         secret = request.form.get('access_key_secret', '').strip()
+        transport = request.form.get('transport', OBJECTS if config and config['direct_upload'] else 'zip_v1')
+        if transport not in (OBJECTS,'zip_v1'):
+            abort(422, '上传方式无效')
+        direct = transport == OBJECTS
         if not (REGION.fullmatch(region) and BUCKET.fullmatch(source) and BUCKET.fullmatch(review) and source != review):
             return view_settings(config, '请填写正确的地域和两个不同的 Bucket。', 422)
         if key or secret:
@@ -80,23 +86,29 @@ def setup_oss(app, db, write, requires, assert_session, create_source, publish_w
         if request.form.get('action') == 'test':
             draft = dict(access_key_id=key, encrypted_secret=encrypted)
             try:
-                acl = [
-                    get_bucket(Location(region, bucket, f'{PREFIX}/incoming/test'), draft).get_bucket_acl().acl
+                source_client, review_client = [
+                    get_bucket(Location(region, bucket, f'{PREFIX}/incoming/test'), draft)
                     for bucket in (source, review)
                 ]
+                acl = [source_client.get_bucket_acl().acl, review_client.get_bucket_acl().acl]
+                versioned = not direct or review_client.get_bucket_versioning().status == 'Enabled'
             except oss2.exceptions.OssError:
                 return view_settings(config, 'OSS 连接失败。请核对地域、凭据及读取 Bucket ACL 的权限。', 422)
             if acl != ['public-read', 'private']:
                 return view_settings(config, '工单 Bucket 应为公共读，审核 Bucket 应为私有。', 422)
-            return view_settings(config, '两个 Bucket 均可访问，ACL 与用途匹配。', 200)
+            if not versioned:
+                return view_settings(config, '审核 Bucket 须开启版本控制。', 422)
+            message = '两个 Bucket 均可访问，ACL 与用途匹配。'
+            return view_settings(config, message + (' 审核 Bucket 版本控制已开启。' if direct else ''), 200)
         if request.form.get('action') != 'save':
             abort(422)
         with write() as conn:
             assert_session('admin')
-            conn.execute("""INSERT INTO oss_settings VALUES(1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+            conn.execute("""INSERT INTO oss_settings VALUES(1,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
                          region=excluded.region,source_bucket=excluded.source_bucket,review_bucket=excluded.review_bucket,
-                         access_key_id=excluded.access_key_id,encrypted_secret=excluded.encrypted_secret""",
-                         (region, source, review, key, encrypted))
+                         access_key_id=excluded.access_key_id,encrypted_secret=excluded.encrypted_secret,
+                         direct_upload=excluded.direct_upload""",
+                         (region, source, review, key, encrypted, direct))
         flash('OSS 设置已保存。', 'success')
         return redirect(url_for('oss.show'), code=303)
 
@@ -116,16 +128,44 @@ def setup_oss(app, db, write, requires, assert_session, create_source, publish_w
             batch = manual_batch(db(), work)
             if not batch or PurePosixPath(filename).suffix.lower() != '.zip':
                 abort(409, '仅可给等待手动交付的当前批次上传 ZIP')
-            location = Location(**json.loads(batch['location']))
-            # Each retry has a different object key, even within the same work attempt.
-            location = Location(location.region, location.bucket, location.key.removesuffix('.zip') + f'/{transfer}.zip')
+            root = Location(**json.loads(batch['location']))
             attempt = batch['attempt']
             options, mime = {}, 'application/zip'
+            if root.key.startswith(f'{PREFIX}/jobs/'):
+                kind = batch['kind']
+                location = root.at(transfer)
+                options = dict(protocol=OBJECTS, work_kind=kind)
+                if kind == 'finalize':
+                    sha = request.form.get('sha256')
+                    declaration(dict(size_bytes=size,sha256=sha),MAX_ARTIFACT,versioned=False)
+                    verification = json_object(request.form.get('final_verification',''))
+                    if request.form.get('input_manifest_sha256') != batch['manifest_hash']:
+                        abort(409, '交付 ZIP 与当前工单清单不符')
+                    options.update(sha256=sha, final_verification=verification)
+            else:
+                if not processor_ready:
+                    abort(409, 'ZIP 交付需要配置云端校验服务')
+                location = Location(root.region,root.bucket,root.key.removesuffix('.zip') + f'/{transfer}.zip')
         else:
             options, mime = create_source(None, filename, request.form)
-            location = Location(config['region'], config['source_bucket'], f'{PREFIX}/incoming/sources/{transfer}')
-        bucket = get_bucket(location, config)
-        upload = bucket.init_multipart_upload(location.key, headers={'Content-Type': mime}).upload_id
+            if config['direct_upload']:
+                if options['mode'] != 'node_local_v1':
+                    abort(422, '逐图直传工单使用同机审片')
+                sha = request.form.get('sha256')
+                declaration(dict(size_bytes=size,sha256=sha),MAX_ARTIFACT,versioned=False)
+                name = 'source' + PurePosixPath(filename).suffix.lower()
+                location = Location(config['region'],config['source_bucket'],f'{PREFIX}/sources/{transfer}/{name}')
+                options.update(protocol=OBJECTS,sha256=sha)
+            else:
+                if not processor_ready:
+                    abort(409, 'ZIP 交付需要配置云端校验服务')
+                location = Location(config['region'],config['source_bucket'],f'{PREFIX}/incoming/sources/{transfer}')
+        target = multipart_location(location, options)
+        headers = {'Content-Type': mime}
+        if 'sha256' in options:
+            headers[HASH_HEADER] = options['sha256']
+        bucket = get_bucket(target, config) if target else None
+        upload = bucket.init_multipart_upload(target.key, headers=headers).upload_id if bucket else None
         try:
             with write() as conn:
                 assert_session('admin')
@@ -136,9 +176,19 @@ def setup_oss(app, db, write, requires, assert_session, create_source, publish_w
                              (transfer, g.user['id'], work, attempt, json.dumps(location.public()), filename,
                               size, upload, mime, json.dumps(options), 'uploading', None, None, timestamp, timestamp))
         except BaseException:
-            bucket.abort_multipart_upload(location.key, upload)
+            if bucket:
+                bucket.abort_multipart_upload(target.key, upload)
             raise
-        return jsonify(id=transfer, part_size_bytes=PART_BYTES), 201
+        return jsonify(id=transfer, part_size_bytes=PART_BYTES, multipart=bool(upload),
+                       input_manifest_sha256=batch['manifest_hash'] if work else None), 201
+
+    def multipart_location(location, options):
+        if options.get('protocol') != OBJECTS or not options.get('work_kind'):
+            return location
+        return location.at('delivery.zip') if options['work_kind'] == 'finalize' else None
+
+    def upload_target(row):
+        return multipart_location(Location(**json.loads(row['location'])),json.loads(row['options']))
 
     def browser_transfer(transfer):
         row = db().execute('SELECT * FROM oss_transfers WHERE id=? AND actor=?', (transfer,g.user['id'])).fetchone()
@@ -151,12 +201,12 @@ def setup_oss(app, db, write, requires, assert_session, create_source, publish_w
     def part(transfer, number):
         access()
         row = browser_transfer(transfer)
-        if row['state'] != 'uploading' or not 1 <= number <= (row['size_bytes'] + PART_BYTES - 1)//PART_BYTES:
+        if row['state'] != 'uploading' or not row['multipart_id'] or not 1 <= number <= (row['size_bytes'] + PART_BYTES - 1)//PART_BYTES:
             abort(409, '上传已结束或分片编号无效')
         if row['work'] and not manual_batch(db(), row['work'], row['attempt']):
             abort(409, '工单已更新，请刷新')
-        location = Location(**json.loads(row['location']))
-        url = get_bucket(location).sign_url('PUT', location.key, URL_SECONDS,
+        location = upload_target(row)
+        url = get_bucket(location).sign_url('PUT', location.key, URL_SECONDS,slash_safe=True,
                                             params={'uploadId': row['multipart_id'], 'partNumber': str(number)})
         return jsonify(url=url)
 
@@ -169,8 +219,11 @@ def setup_oss(app, db, write, requires, assert_session, create_source, publish_w
             return jsonify(state=row['state']), 202
         if row['work'] and not manual_batch(db(), row['work'], row['attempt']):
             abort(409, '工单已更新，请刷新')
-        location = Location(**json.loads(row['location']))
+        if not row['multipart_id']:
+            abort(409, '请使用逐图提交接口')
+        location = upload_target(row)
         bucket = get_bucket(location)
+        options = json.loads(row['options'])
         try:
             parts = list(oss2.PartIterator(bucket, location.key, row['multipart_id']))
             expected = (row['size_bytes'] + PART_BYTES - 1)//PART_BYTES
@@ -178,22 +231,81 @@ def setup_oss(app, db, write, requires, assert_session, create_source, publish_w
                     part.part_number != i or part.size != min(PART_BYTES, row['size_bytes'] - (i-1)*PART_BYTES)
                     for i, part in enumerate(parts, 1))):
                 abort(409, '上传分片不完整，请重试')
-            bucket.complete_multipart_upload(location.key, row['multipart_id'], parts)
+            kwargs = {'headers': {'x-oss-forbid-overwrite':'true'}} if not row['work'] and options.get('protocol') == OBJECTS else {}
+            completed = bucket.complete_multipart_upload(location.key, row['multipart_id'], parts, **kwargs)
         except oss2.exceptions.NoSuchUpload:
             # The multipart request may have completed before the browser received its response.
-            if bucket.head_object(location.key).content_length != row['size_bytes']:
+            completed = bucket.head_object(location.key)
+            if completed.content_length != row['size_bytes']:
                 abort(409, '未找到完整上传')
+        if options.get('protocol') == OBJECTS:
+            if row['work']:
+                version = completed.headers.get('x-oss-version-id')
+                item = dict(version_id=version,size_bytes=row['size_bytes'],sha256=options['sha256'])
+                declaration(item, MAX_ARTIFACT)
+                options['objects'] = {'delivery.zip':item}
+            else:
+                version = completed.headers.get('x-oss-version-id')
+                if version and version != 'null':
+                    options['version_id'] = version
+                    location = Location(location.region,location.bucket,location.key,version)
+                confirm_object(bucket,location,row['size_bytes'],options['sha256'],row['media_type'])
+        return queue_browser(row,options)
+
+    def queue_browser(row, options):
         with write() as conn:
             assert_session('admin')
-            current = browser_transfer(transfer)
-            if current['state'] == 'uploading':
-                if row['work']:
-                    if not manual_batch(conn,row['work'],row['attempt']):
-                        abort(409, '工单已更新，请刷新')
-                    conn.execute("UPDATE execution_work SET state='verifying',stage='oss_verifying',updated=? WHERE id=?",
-                                 (int(time.time()), row['work']))
-                conn.execute("UPDATE oss_transfers SET state='ready',updated=? WHERE id=?", (int(time.time()),transfer))
+            current = browser_transfer(row['id'])
+            if current['state'] != 'uploading':
+                return jsonify(state=current['state']), 202
+            if row['work']:
+                if not manual_batch(conn,row['work'],row['attempt']):
+                    abort(409, '工单已更新，请刷新')
+                conn.execute("UPDATE execution_work SET state='verifying',stage='oss_verifying',updated=? WHERE id=?",
+                             (int(time.time()),row['work']))
+            conn.execute("UPDATE oss_transfers SET state='ready',options=?,updated=? WHERE id=?",
+                         (json.dumps(options),int(time.time()),row['id']))
         return jsonify(state='ready'), 202
+
+    def manual_objects(transfer):
+        access()
+        row = browser_transfer(transfer)
+        options = json.loads(row['options'])
+        kind = options.get('work_kind')
+        if not kind or kind == 'finalize' or options.get('protocol') != OBJECTS:
+            abort(409, '该批次使用整包上传')
+        return row, options, kind
+
+    @ui.post('/admin/execution/oss/uploads/<transfer>/objects/sign')
+    @requires('admin')
+    def sign_objects(transfer):
+        row, _, kind = manual_objects(transfer)
+        if row['state'] != 'uploading' or not manual_batch(db(),row['work'],row['attempt']):
+            abort(409, '工单已更新，请刷新')
+        names = json_object(request.form.get('objects',''))
+        if not 1 <= len(names) <= 24:
+            abort(422, '每批请请求 1 到 24 个文件')
+        location = Location(**json.loads(row['location']))
+        bucket = get_bucket(location)
+        signed = {}
+        for name,item in names.items():
+            _, mime, limit = file_type(kind,name)
+            declaration(item,limit,versioned=False)
+            ref = location.at(name)
+            headers = {'Content-Type':mime,HASH_HEADER:item['sha256']}
+            signed[name] = dict(url=bucket.sign_url('PUT',ref.key,URL_SECONDS,slash_safe=True,headers=headers),
+                                headers=headers)
+        return jsonify(signed)
+
+    @ui.post('/admin/execution/oss/uploads/<transfer>/objects/complete')
+    @requires('admin')
+    def finish_objects(transfer):
+        row,options,kind = manual_objects(transfer)
+        if row['state'] != 'uploading':
+            return jsonify(state=row['state']), 202
+        objects = json_object(request.form.get('objects',''))
+        declarations(kind,objects)
+        return queue_browser(row,options | {'objects':objects})
 
     @ui.get('/admin/execution/oss/uploads/<transfer>')
     @requires('admin')
@@ -204,9 +316,13 @@ def setup_oss(app, db, write, requires, assert_session, create_source, publish_w
 
     @ui.errorhandler(HTTPException)
     def upload_error(error):
-        if request.endpoint in {'oss.begin','oss.part','oss.finish_upload','oss.status'}:
+        if request.endpoint in {'oss.begin','oss.part','oss.finish_upload','oss.status','oss.sign_objects','oss.finish_objects'}:
             return jsonify(message=error.description), error.code
         return error
+
+    @ui.errorhandler(ValueError)
+    def invalid_upload(error):
+        return jsonify(message=str(error)[:240]), 422
 
     @ui.errorhandler(oss2.exceptions.OssError)
     def oss_error(_error):

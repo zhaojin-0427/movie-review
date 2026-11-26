@@ -317,6 +317,235 @@ class ExecutionTest(unittest.TestCase):
             self.assertEqual(download.status_code,302)
             self.assertIn('video-gr.',download.location)
 
+    def test_oss_objects_uses_pinned_images_and_whole_delivery_without_cloud_processor(self):
+        from types import SimpleNamespace
+        from oss_objects import file_type
+
+        objects, uploads, reads = {}, {}, []
+        parts = {}
+        content = b'original-video'
+        self.environment = dict(os='macOS 15.7',render_backend='cpu')
+        artifact_versions = 0
+
+        def uploaded(key, data, mime, headers=None):
+            nonlocal artifact_versions
+            artifact_versions += 1
+            tag = f'version-{artifact_versions}'
+            metadata = {'Content-Type':mime,'x-oss-version-id':tag,'x-oss-meta-sha256':sha(data)} | (headers or {})
+            objects[key,tag] = (data,metadata)
+            objects[key,None] = objects[key,tag]
+            return dict(version_id=tag,size_bytes=len(data),sha256=sha(data))
+
+        class FakeBucket:
+            def __init__(self, location):
+                self.location = location
+
+            def init_multipart_upload(self, key, headers):
+                uploads[key] = headers
+                return SimpleNamespace(upload_id=key)
+
+            def complete_multipart_upload(self, key, upload_id, result, **_):
+                data = parts[upload_id]
+                uploaded(key,data,uploads[key]['Content-Type'],uploads[key])
+                return self.head_object(key)
+
+            def sign_url(self, method, key, expires, **options):
+                location = self.location
+                url = f'https://{location.bucket}.oss-{location.region}.aliyuncs.com/{key}'
+                version = (options.get('params') or {}).get('versionId')
+                return url + ('?versionId='+version if version else '')
+
+            def head_object(self,key,params=None):
+                data, headers = objects[key,(params or {}).get('versionId')]
+                return SimpleNamespace(content_length=len(data),headers=headers)
+
+            def get_object(self,key,params=None):
+                reads.append(key)
+                self_data = objects[key,(params or {}).get('versionId')][0]
+                return io.BytesIO(self_data)
+
+        self.app = create_app(dict(TESTING=True,SECRET_KEY='test',DATA_DIR=self.root,
+                                   OSS_BUCKET_FACTORY=lambda location,*_: FakeBucket(location)))
+        self.admin, self.reviewer, self.other = (self.login(name) for name in ('admin','reviewer','other'))
+        self.api = self.app.test_client()
+        self.profile = {'profile_hash':'a'*64}
+        self.assertEqual(self.post(self.admin,'/admin/execution/oss',region='cn-beijing',source_bucket='video-public',
+            review_bucket='video-gr',access_key_id='testAccessKey123',access_key_secret='testSecretKey456',
+            action='save',transport='objects_v1').status_code,303)
+        browser = '/admin/execution/oss/uploads'
+
+        def multipart(reply,data):
+            self.assertEqual(reply.status_code,201,reply.text)
+            key = reply.json['id']
+            with closing(sqlite3.connect(self.root/'review.sqlite3')) as conn:
+                upload = conn.execute('SELECT multipart_id FROM oss_transfers WHERE id=?',(key,)).fetchone()[0]
+            parts[upload] = data
+            response = self.post(self.admin,f'{browser}/{key}/complete')
+            self.assertEqual(response.status_code,202,response.text)
+            return self.finish_object_transfer(key,browser)
+
+        def partials(_bucket, _key, upload):
+            return [SimpleNamespace(part_number=1,size=len(parts[upload]))]
+
+        with patch('oss2.PartIterator',partials):
+            origin = multipart(self.post(self.admin,browser,filename='原片.mp4',size_bytes=len(content),
+                                        sha256=sha(content)),content)
+        job_id = str(origin['job'])
+        job = '/jobs/'+job_id
+        self.assertEqual(reads,[])
+        page = self.admin.get('/admin/execution',base_url=BASE).text
+        self.assertIn('data-oss-protocol="objects_v1"',page)
+        self.assertIn('vendor/zip-native.min.js',page)
+        self.register(local=True)
+        self.heartbeat()
+        self.claim('old-objects-capability',204)
+        self.machine('POST','/workers/register',dict(node_key=self.node,instance_id=self.instance,
+                      capabilities=dict(slots=1,max_frame_width=32,work_kinds=['prepare','revise','finalize'],
+                                        render_backends=['cpu'],oss_objects=True)),
+                     key='register-objects',headers={REVIEW_STORAGE_HEADER:LOCAL_REVIEW})
+        self.assertEqual(self.post(self.admin,f'/admin/execution/devices/{self.node}/oss-delivery',
+                                  oss_delivery='auto').status_code,303)
+        self.heartbeat()
+        first = self.claim('objects-first')
+        self.assertEqual(first['oss']['protocol'],'objects_v1')
+        self.assertIn('video-public.oss-cn-beijing.aliyuncs.com/movie-review/sources/',first['oss']['source_url'])
+
+        def descriptor(work, files, target):
+            return {name:uploaded(f'{target}/{name}',data,file_type(work['kind'],name)[1])
+                    for name,data in files.items()}
+
+        def batch(work,key):
+            return self.machine('POST',f'/work/{work["work_id"]}/oss/objects',
+                      dict(input_manifest_sha256=work['input_manifest_sha256']),
+                      lease=work['lease'],key=key,status=201).json
+
+        def submit(work,key,extra=None,status=202):
+            response = self.machine('POST',f'/work/{work["work_id"]}/oss/submit',
+                        dict(input_manifest_sha256=work['input_manifest_sha256'],**(extra or {})),
+                        lease=work['lease'],key=key,status=status)
+            return response.json
+
+        old = batch(first,'begin-old')
+        self.return_work(first,'leased')
+        self.heartbeat()
+        work = self.claim('objects-after-return')
+        target = batch(work,'begin-new')
+        self.assertEqual(batch(work,'begin-new'),target)
+        self.assertNotEqual(old['key'],target['key'])
+        self.assertIn('/review/v0001/',target['key'])
+        submit(first,'stale-object-submit',status=409)
+        self.machine('POST',f'/work/{work["work_id"]}/oss/submit',
+                     dict(input_manifest_sha256=work['input_manifest_sha256'],upload_id=old['upload_id'],
+                          objects={'pairs/000001.jpg':{'version_id':'old','size_bytes':1,'sha256':'a'*64}}),
+                     key='use-old-directory',lease=work['lease'],status=422)
+        size = dict(width=32,height=18)
+        first_jpg = image('JPEG',(32,36),'red')
+        second_jpg = image('JPEG',(32,36),'gray')
+        timeline = to_json(dict(source_sha256=sha(content),time_base='1/1000',end_pts=80,
+            frames=[dict(number=1,pts=0),dict(number=2,pts=40)]))
+        shot = b'{"description":"scene"}\n'
+        report = to_json(dict(frame_count=2))
+        scene_hash = sha(b'model')
+        frame_paths = [f'pairs/{n:06}.jpg' for n in (1,2)]
+        frames = [dict(number=n,pts=(n-1)*40,pair_jpeg_path=frame_paths[n-1],
+                       review_signature=sha(data)) for n,data in enumerate((first_jpg,second_jpg),1)]
+
+        def review_files(work, changed, frame_list, base_sha=None):
+            bound = dict(job_id=job_id,version=work['input_manifest']['target_version'],source_sha256=sha(content),
+                         timeline_sha256=sha(timeline),input_manifest_sha256=work['input_manifest_sha256'],
+                         review_storage=work['input_manifest']['review_storage'],review_media='objects_v1')
+            index = to_json(bound | dict(base_manifest_sha256=base_sha,
+                frames=[dict(number=n,size_bytes=len(data),sha256=sha(data)) for n,data in sorted(changed.items())]))
+            version = to_json(bound | dict(shot_metadata_sha256=sha(shot),production_report_sha256=sha(report),
+                review_index_sha256=sha(index),production_method='codex_trial',review_size=size,final_size=size,
+                scene_sha256=scene_hash,frame_count=2,frames=frame_list))
+            files = {'review-index.json':index,'version.json':version,'meta.jsonl':shot,'production.json':report}
+            if work['kind']=='prepare':
+                files['timeline.json'] = timeline
+            return files | {frame_paths[n-1]:data for n,data in changed.items()}
+
+        files = review_files(work,{1:first_jpg,2:second_jpg},frames)
+        declarations = descriptor(work,files,target['key'])
+        uploaded(f'{target["key"]}/{frame_paths[0]}',b'replaced at same key','image/jpeg')
+        submission = submit(work,'submit-first',dict(upload_id=target['upload_id'],objects=declarations))
+        receipt = self.finish_object_transfer(submission['transfer_id'])
+        self.assertEqual(receipt['state'],'succeeded')
+        self.assertEqual(self.post(self.reviewer,job+'/claim').status_code,303)
+        prior = self.reviewer.get(job+'/v/1/image/1',base_url=BASE)
+        self.assertIn('versionId='+declarations[frame_paths[0]]['version_id'],prior.location)
+        self.assertEqual(self.other.get(job+'/v/1/image/1',base_url=BASE).status_code,404)
+        self.assertEqual(self.post(self.reviewer,job+'/v/1/frames/1',action='approve',revision='0').status_code,303)
+        self.assertEqual(self.post(self.reviewer,job+'/v/1/frames/2',action='save',revision='1',note='调整').status_code,303)
+        self.assertEqual(self.post(self.reviewer,job+'/v/1/return',revision='2').status_code,303)
+        self.assertEqual(self.post(self.admin,f'/admin/execution/devices/{self.node}/oss-delivery',
+                                  oss_delivery='manual').status_code,303)
+        self.heartbeat()
+        revise = self.claim('objects-revise')
+        self.assertEqual(revise['oss']['review_scope'],'rejected_frames')
+        self.assertEqual(submit(revise,'manual-review-ready')['state'],'awaiting_manual')
+
+        def reupload(files):
+            reply = self.post(self.admin,browser,filename='review.zip',size_bytes=100,work_id=revise['work_id'])
+            self.assertEqual(reply.status_code,201,reply.text)
+            self.assertFalse(reply.json['multipart'])
+            transfer = reply.json['id']
+            upload_path = browser+'/'+transfer
+            declarations = {}
+            for name,data in files.items():
+                size_sha = dict(size_bytes=len(data),sha256=sha(data))
+                signed = self.post(self.admin,upload_path+'/objects/sign',objects=json.dumps({name:size_sha}))
+                self.assertEqual(signed.status_code,200,signed.text)
+                signed_ref = signed.json[name]
+                key = signed_ref['url'].split('.aliyuncs.com/',1)[1]
+                self.assertIn('/review/v0002/',key)
+                declarations[name] = uploaded(key,data,signed_ref['headers']['Content-Type'],signed_ref['headers'])
+            response = self.post(self.admin,upload_path+'/objects/complete',objects=json.dumps(declarations))
+            self.assertEqual(response.status_code,202,response.text)
+            return self.finish_object_transfer(transfer,browser,raw=True)
+
+        third_jpg = image('JPEG',(32,36),'blue')
+        revised = [frames[0], frames[1] | dict(review_signature=sha(third_jpg))]
+        revise_files = review_files(revise,{2:third_jpg},revised,self.artifacts(revise)['version_manifest']['sha256'])
+        self.assertEqual(reupload(revise_files | {frame_paths[0]:first_jpg})['state'],'rejected')
+        self.assertEqual(reupload(revise_files)['state'],'done')
+        self.assertEqual(self.reviewer.get(job+'/v/2/image/1',base_url=BASE).location,prior.location)
+        self.assertEqual(self.reviewer.get(job+'/v/2/frame-data/1?revision=0',base_url=BASE).json['frame']['state'],'approved')
+        self.assertEqual(self.post(self.reviewer,job+'/v/2/frames/2',action='approve',revision='0').status_code,303)
+        self.heartbeat()
+        final = self.claim('objects-final')
+        self.assertEqual(submit(final,'manual-delivery-ready')['state'],'awaiting_manual')
+        inputs = self.artifacts(final)
+        verification = dict(version_manifest_sha256=inputs['version_manifest']['sha256'],
+            approval_manifest_sha256=inputs['approval_manifest']['sha256'],timeline_sha256=inputs['source_timeline']['sha256'],
+            scene_sha256=scene_hash,frame_count=2,verified_review_frames=2,white_frame_count=2,
+            comparison_frame_count=2,pts_verified=True,audio_verified=True,white_size=size,
+            comparison_size=dict(width=32,height=36),render_source='approved_native_white')
+        # The submitted ZIP stays intact and only its object properties are inspected.
+        file = zip_bytes({'delivery-proof.json':to_json(dict(final_verification=verification)),'media/render.mp4':b'delivery-video'})
+        with patch('oss2.PartIterator',partials):
+            delivered = multipart(self.post(self.admin,browser,filename='成片.zip',size_bytes=len(file),
+                sha256=sha(file),work_id=final['work_id'],input_manifest_sha256=final['input_manifest_sha256'],
+                final_verification=json.dumps(verification)),file)
+        self.assertEqual([item['role'] for item in delivered['artifacts']],['delivery_bundle'])
+        download = self.admin.get('/admin/execution'+job+'/delivery/2/delivery_bundle',base_url=BASE)
+        self.assertIn('/delivery/from-v0002/',download.location)
+        self.assertTrue(all(key.endswith(('version.json','review-index.json','timeline.json')) for key in reads),reads)
+        self.assertEqual(objects[download.location.split('.aliyuncs.com/',1)[1].split('?',1)[0],None][0],file)
+
+    def finish_object_transfer(self, transfer, portal_path=None, raw=False):
+        result = self.app.test_cli_runner().invoke(args=['oss-process'])
+        self.assertEqual(result.exit_code,0,result.output)
+        if portal_path:
+            data = self.admin.get(portal_path+'/'+transfer,base_url=BASE).json
+        else:
+            with closing(sqlite3.connect(self.root/'review.sqlite3')) as conn:
+                state,error,payload = conn.execute('SELECT state,error,result FROM oss_transfers WHERE id=?',(transfer,)).fetchone()
+            data = dict(state=state,error=error,result=json.loads(payload) if payload else None)
+        if raw:
+            return data
+        self.assertEqual(data['state'],'done',data)
+        return data['result']
+
     def test_devices_and_work_orders_are_compact_by_default(self):
         self.setup_profile()
         page = self.admin.get('/admin/execution#devices', base_url=BASE).text

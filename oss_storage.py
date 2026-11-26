@@ -16,6 +16,8 @@ from cryptography.fernet import Fernet
 PREFIX = 'movie-review'
 PART_BYTES = 32 * 1024**2
 URL_SECONDS = 900
+OBJECTS = 'objects_v1'
+VERSION_ID = re.compile(r'[A-Za-z0-9+/=._~-]{1,256}\Z')
 REGION = re.compile(r'cn-[a-z0-9]+(?:-[a-z0-9]+)*\Z')
 BUCKET = re.compile(r'[a-z0-9][a-z0-9-]{1,61}[a-z0-9]\Z')
 
@@ -25,11 +27,14 @@ class Location:
     region: str
     bucket: str
     key: str
+    version_id: str | None = None
 
     def __post_init__(self):
         if (not REGION.fullmatch(self.region) or not BUCKET.fullmatch(self.bucket)
-                or not re.fullmatch(r'movie-review/(incoming|published)/[A-Za-z0-9_./-]+', self.key)
-                or any(part in ('', '.', '..') for part in self.key.split('/'))):
+                or not re.fullmatch(r'movie-review/(incoming|published|sources|jobs)/[A-Za-z0-9_./-]+', self.key)
+                or any(part in ('', '.', '..') for part in self.key.split('/'))
+                or (self.version_id is not None and (not isinstance(self.version_id, str)
+                    or not VERSION_ID.fullmatch(self.version_id) or self.version_id == 'null'))):
             raise ValueError('OSS 对象位置无效')
 
     @property
@@ -37,7 +42,17 @@ class Location:
         return f'https://{self.bucket}.oss-{self.region}.aliyuncs.com/{quote(self.key, safe="/")}'
 
     def public(self):
-        return dict(region=self.region, bucket=self.bucket, key=self.key)
+        ref = dict(region=self.region, bucket=self.bucket, key=self.key)
+        if self.version_id:
+            ref['version_id'] = self.version_id
+        return ref
+
+    def at(self, name, version_id=None):
+        return Location(self.region, self.bucket, f'{self.key}/{name}', version_id)
+
+    @property
+    def params(self):
+        return {'versionId': self.version_id} if self.version_id else None
 
 
 def cipher(app_secret):

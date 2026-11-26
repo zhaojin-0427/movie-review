@@ -185,7 +185,8 @@ CREATE TABLE IF NOT EXISTS execution_management_events (
 CREATE TABLE IF NOT EXISTS oss_settings (
     id INTEGER PRIMARY KEY CHECK(id=1), region TEXT NOT NULL,
     source_bucket TEXT NOT NULL, review_bucket TEXT NOT NULL,
-    access_key_id TEXT NOT NULL, encrypted_secret TEXT NOT NULL
+    access_key_id TEXT NOT NULL, encrypted_secret TEXT NOT NULL,
+    direct_upload INTEGER NOT NULL DEFAULT 0 CHECK(direct_upload IN (0,1))
 );
 CREATE TABLE IF NOT EXISTS oss_artifacts (
     artifact TEXT PRIMARY KEY REFERENCES execution_artifacts(id), location TEXT NOT NULL
@@ -206,3 +207,8 @@ CREATE TABLE IF NOT EXISTS oss_transfers (
     state TEXT NOT NULL, error TEXT, result TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS oss_transfers_state ON oss_transfers(state,created);
+
+CREATE TABLE IF NOT EXISTS execution_oss_object_uploads (
+    id TEXT PRIMARY KEY, work TEXT NOT NULL REFERENCES execution_work(id), attempt INTEGER NOT NULL,
+    location TEXT NOT NULL
+);

@@ -1,7 +1,13 @@
 {% extends 'base.html' %}
 {% block title %}执行管理 · 镜头审核{% endblock %}
 {% block main_class %}page execution-page{% endblock %}
-{% block page_scripts %}{% if oss_enabled %}<script src="{{ url_for('static', filename='oss-upload.js', v=1) }}" defer></script>{% endif %}{% endblock %}
+{% block page_scripts %}
+{% if oss_enabled %}
+<script src="{{ url_for('static', filename='vendor/sha256.min.js', v='0.11.1') }}" defer></script>
+<script src="{{ url_for('static', filename='vendor/zip-native.min.js', v='2.8.26') }}" defer></script>
+<script src="{{ url_for('static', filename='oss-upload.js', v=2) }}" defer></script>
+{% endif %}
+{% endblock %}
 {% block content %}
 {% macro detail_header(id, title, subtitle, status, badge) %}
   <header class="execution-dialog-header">
@@ -104,7 +110,7 @@
               <div><dt>渲染后端</dt><dd>{{ node.cap.render_backends|join(' / ') }}</dd></div>
               <div><dt>最大宽度</dt><dd>{{ node.cap.max_frame_width }} px</dd></div>
               <div><dt>同机审片</dt><dd>{{ '支持' if node.cap.review_storage == local_review_mode else '未声明' }}</dd></div>
-              <div><dt>OSS 交付协议</dt><dd>{{ '支持' if node.cap.oss_delivery else '未声明' }}</dd></div>
+              <div><dt>OSS 交付协议</dt><dd>{{ '逐图直传' if node.cap.oss_objects else 'ZIP 交付' if node.cap.oss_delivery else '未声明' }}</dd></div>
             </dl>
           </div>{% endif %}
         </section>
@@ -243,11 +249,12 @@
             <p class="field-help">{% if item.review_instance %}绑定设备 · {{ item.review_device }}{% if item.state == 'queued' and not item.review_online %} · 等待原实例上线{% endif %}{% elif item.state == 'queued' %}等待支持同机审片的设备领取。{% endif %}</p>
             {% endif %}
           </div>
-          {% if oss_enabled and item.state == 'awaiting_manual' %}
+          {% if oss_enabled and (item.oss_objects or oss_legacy_upload) and item.state == 'awaiting_manual' %}
           <form class="stack execution-dialog-box" data-oss-manual
-                data-oss-url="{{ url_for('oss.begin') }}" data-work-id="{{ item.id }}">
+                data-oss-url="{{ url_for('oss.begin') }}" data-work-id="{{ item.id }}"
+                data-work-kind="{{ item.kind }}"{% if item.oss_objects %} data-oss-protocol="objects_v1"{% endif %}>
             <input type="hidden" name="csrf" value="{{ csrf_token() }}">
-            <label>手动上传交付 ZIP<input name="submission" type="file" accept=".zip" required></label>
+            <label>手动上传{{ '成片' if item.kind == 'finalize' else '审片' }} ZIP<input name="submission" type="file" accept=".zip" required></label>
             <button type="submit" class="button primary">上传并校验</button>
             <p class="field-help" role="status"></p>
           </form>
@@ -255,7 +262,9 @@
           <div class="execution-actions execution-dialog-links">
             <a class="button small" href="{{ url_for('execution.source_video',job=item.job) }}">下载原片</a>
             {% if item.review_exists %}<a class="button small" href="{{ url_for('review',job_id=item.job) }}">审核详情</a>{% endif %}
-            {% if item.delivered and item.kind == 'finalize' %}<a class="button small" href="{{ url_for('execution.delivery',job=item.job,version=item.target,role='delivery_bundle') }}">下载交付包</a><a class="button small" href="{{ url_for('execution.delivery',job=item.job,version=item.target,role='white_video') }}">白模视频</a><a class="button small" href="{{ url_for('execution.delivery',job=item.job,version=item.target,role='comparison_video') }}">对比视频</a>{% endif %}
+            {% for role, label in [('delivery_bundle','下载交付包'),('white_video','白模视频'),('comparison_video','对比视频')] if role in item.delivery_roles %}
+              <a class="button small" href="{{ url_for('execution.delivery',job=item.job,version=item.target,role=role) }}">{{ label }}</a>
+            {% endfor %}
           </div>
         </section>
         <section class="execution-dialog-body" role="tabpanel" id="{{ item.id }}-history" aria-labelledby="{{ item.id }}-tab-history" tabindex="0" hidden>
@@ -303,7 +312,7 @@
   </section>
   <section class="panel form-panel execution-create-panel" aria-labelledby="job-create-title">
     <div class="section-heading"><div><h2 id="job-create-title">上传视频</h2><p>工单以视频文件名命名。</p></div></div>
-    <form method="post" enctype="multipart/form-data" action="{{ url_for('execution.create_job') }}" class="stack" data-batch-upload{% if oss_enabled %} data-oss-url="{{ url_for('oss.begin') }}"{% endif %}>
+    <form method="post" enctype="multipart/form-data" action="{{ url_for('execution.create_job') }}" class="stack" data-batch-upload{% if oss_enabled and (oss_direct_upload or oss_legacy_upload) %} data-oss-url="{{ url_for('oss.begin') }}"{% if oss_direct_upload %} data-oss-protocol="objects_v1"{% endif %}{% endif %}>
       <input type="hidden" name="csrf" value="{{ csrf_token() }}">
       <label class="execution-dropzone" for="execution-source" data-upload-dropzone tabindex="0">
         <span class="execution-dropzone-icon" aria-hidden="true">↥</span>
@@ -314,7 +323,7 @@
       <input class="visually-hidden" id="execution-source" type="file" name="source" accept=".mp4,.mov,.mkv,.webm,.m4v" multiple required>
       <div class="execution-upload-files" data-upload-files hidden></div>
       <label>审片存储<select name="review_mode">
-        {% for key, label in review_modes.items() %}<option value="{{ key }}"{% if key == local_review_mode %} selected{% endif %}>{{ label }}</option>{% endfor %}
+        {% for key, label in review_modes.items() if not (oss_enabled and oss_direct_upload) or key == local_review_mode %}<option value="{{ key }}"{% if key == local_review_mode %} selected{% endif %}>{{ label }}</option>{% endfor %}
       </select></label>
       <label>成片质量<select name="export_quality">
         <option value="1080p">1080p</option>

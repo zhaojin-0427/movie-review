@@ -72,7 +72,7 @@ curl --config upload.curl \
 
 ## OSS 直传
 
-管理员通过 HTTPS 打开「执行管理 → OSS 设置」配置原片与审核交付 Bucket。OSS 接入依赖同地域校验服务，部署及权限见 [OSS 部署](docs/OSS部署.md)，设备接入见 [执行端 OSS 协议](docs/OSS执行端接入.md)。
+管理员通过 HTTPS 打开「执行管理 → OSS 设置」配置原片与审核交付 Bucket。新同机审片工单支持 [逐图直传与成片整包](docs/OSS逐图直传协议.md)。历史 OSS ZIP 链路依赖同地域处理服务，参见 [ZIP 链路部署](docs/OSS部署.md) 与 [ZIP 执行端协议](docs/OSS执行端接入.md)。
 
 ## Ubuntu 内网运行
 

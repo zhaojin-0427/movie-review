@@ -8,9 +8,13 @@
 <section class="panel form-panel" aria-labelledby="oss-settings-title">
   <h2 id="oss-settings-title">Bucket 与访问凭据</h2>
   {% if message %}<p class="notice" role="status">{{ message }}</p>{% endif %}
-  <p class="notice">{{ '已配置云端校验服务地址' if processor_ready else '云端校验服务尚未配置，配置完成后可使用 OSS 上传。' }}</p>
+  <p class="notice">{% if config.direct_upload %}逐图直传由 247 核验 OSS 对象和清单，审核员直接从 OSS 查看图片。{% elif processor_ready %}已配置 ZIP 云端校验服务。{% else %}ZIP 交付尚未配置云端校验服务。可切换到逐图直传。{% endif %}</p>
   <form class="stack" method="post">
     <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <label>新工单 OSS 交付<select name="transport">
+      <option value="objects_v1"{% if config.direct_upload %} selected{% endif %}>逐图直传 / 成片整包</option>
+      <option value="zip_v1"{% if not config.direct_upload %} selected{% endif %}>ZIP 云端校验</option>
+    </select><small class="field-help">逐图直传使用同机审片，私有审核 Bucket 需开启 OSS 版本控制。</small></label>
     <label>地域<input name="region" value="{{ config.region or 'cn-beijing' }}" required pattern="cn-[a-z0-9]+(?:-[a-z0-9]+)*"></label>
     <label>工单原片 Bucket<input name="source_bucket" value="{{ config.source_bucket or 'video-public' }}" required>
       <small class="field-help">公共读。执行端通过原片链接直接下载。</small></label>
