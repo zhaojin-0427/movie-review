@@ -19,7 +19,8 @@ from zipfile import ZipFile, ZipInfo
 from PIL import Image
 
 from app import create_app
-from execution import LOCAL_REVIEW, PART_SIZE, REVIEW_STORAGE_HEADER, object_hash
+from execution import (LOCAL_REVIEW, PART_SIZE, REJECTED_FRAMES_MODE, REVIEW_STORAGE_HEADER,
+                       REVIEW_UPLOAD_HEADER, object_hash)
 
 BASE = 'https://localhost'
 PASSWORD = 'test-only-passphrase'
@@ -234,11 +235,14 @@ class ExecutionTest(unittest.TestCase):
         with closing(sqlite3.connect(self.root / 'review.sqlite3')) as conn:
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM execution_jobs').fetchone()[0], 3)
 
-    def register(self,token=None,node=None,instance=None,key='register',status=200,local=False):
+    def register(self,token=None,node=None,instance=None,key='register',status=200,local=False,incremental=False):
+        headers = {REVIEW_STORAGE_HEADER: LOCAL_REVIEW} if local else {}
+        if incremental:
+            headers[REVIEW_UPLOAD_HEADER] = REJECTED_FRAMES_MODE
         return self.machine('POST','/workers/register',dict(node_key=node or self.node,instance_id=instance or self.instance,
             capabilities=dict(slots=1,max_frame_width=32,work_kinds=['prepare','revise','finalize'],
                               profile_hashes=[self.profile['profile_hash']],render_backends=['cpu'],environment=self.environment)),
-                            key=key,status=status,token=token,headers={REVIEW_STORAGE_HEADER:LOCAL_REVIEW} if local else None)
+                             key=key,status=status,token=token,headers=headers)
 
     def heartbeat(self,free=10,reserve=9,token=None):
         return self.machine('POST',f'/workers/{self.node}/heartbeat',dict(instance_id=self.instance,available_slots=1,
@@ -283,7 +287,7 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual(self.machine('POST',path,data,lease=work['lease'],key='complete').json,response)
         return response
 
-    def produce_review(self,work,version,native_size=None,extra_white=False,check_retry_lock=False):
+    def produce_review(self,work,version,native_size=None,extra_white=False,check_retry_lock=False,unexpected_delta_frame=False):
         inputs = self.artifacts(work)
         frame_size = dict(width=32,height=18)
         timeline = to_json(dict(source_sha256=sha(self.source),time_base='1/1000',end_pts=80,
@@ -305,6 +309,15 @@ class ExecutionTest(unittest.TestCase):
             common['review_storage'] = local
             if not extra_white:
                 files = {name:data for name,data in files.items() if name.startswith('pairs/')}
+        if work['input_manifest'].get('review_upload') == REJECTED_FRAMES_MODE:
+            feedback = self.fetch(work, inputs['feedback_manifest']).json
+            rejected = [frame['number'] for frame in feedback['frames']]
+            full_files = [dict(path=name, size_bytes=len(files[name]), sha256=sha(files[name])) for name in sorted(files)]
+            common['review_delta'] = dict(mode=REJECTED_FRAMES_MODE, base_version=feedback['base_version'],
+                                          base_manifest_sha256=feedback['base_manifest_sha256'], frames=rejected,
+                                          full_files_sha256=object_hash(full_files))
+            if not unexpected_delta_frame:
+                files = {name: data for name, data in files.items() if int(Path(name).stem) in rejected}
         review = zip_bytes(files,common|dict(target_version=version))
         manifest = to_json(common|dict(version=version,frame_count=2,scene_bundle_sha256=sha(scene),review_bundle_sha256=sha(review),
             shot_metadata_sha256=sha(self.meta),production_report_sha256=sha(report),input_manifest_sha256=work['input_manifest_sha256'],
@@ -319,10 +332,10 @@ class ExecutionTest(unittest.TestCase):
         else:
             self.assertEqual(inputs['source_timeline']['sha256'],sha(timeline))
         outputs = [self.upload(work,*record) for record in records]
-        if extra_white:
+        if extra_white or unexpected_delta_frame:
             return self.machine('POST',f'/work/{work["work_id"]}/complete',
                                 dict(input_manifest_sha256=work['input_manifest_sha256'],outputs=outputs),
-                                status=422,key='reject-extra-white',lease=work['lease'])
+                                status=422,key='reject-unexpected-frame',lease=work['lease'])
         if check_retry_lock:
             item = next(item for item in outputs if item['role'] == 'review_bundle')
             with (self.root/'assets'/'execution'/item['artifact_id']).open('rb') as sealed:
@@ -538,6 +551,67 @@ class ExecutionTest(unittest.TestCase):
         status = self.machine('GET',job+'/status?work_id='+final['work_id']).json
         self.assertEqual((status['job_state'],status['work_state'],status['delivery_versions']),('done','succeeded',[2]))
         self.assertEqual(self.post(self.reviewer,job+'/v/2/supplement',revision='2').status_code,303)
+
+    def check_delta_revision(self, local, unexpected=False):
+        self.setup_profile(review_mode=LOCAL_REVIEW if local else 'central')
+        self.register(local=local, incremental=True)
+        self.heartbeat()
+        first = self.claim('first')
+        self.assertNotIn('review_upload', first['input_manifest'])
+        initial = {item['role']: item for item in self.produce_review(first, 1)['artifacts']}
+        job = '/jobs/' + first['job_id']
+        self.assertEqual(self.post(self.reviewer, job + '/claim').status_code, 303)
+        self.assertEqual(self.post(self.reviewer, job + '/v/1/frames/1', action='approve', revision='0').status_code, 303)
+        regions = json.dumps([dict(x=.1, y=.2, w=.3, h=.4, note='detail')])
+        self.assertEqual(self.post(self.reviewer, job + '/v/1/frames/2', action='save', revision='1',
+                                   note='adjust', regions=regions).status_code, 303)
+        self.assertEqual(self.post(self.reviewer, job + '/v/1/return', revision='2').status_code, 303)
+        self.heartbeat()
+        revise = self.claim('revise')
+        self.assertEqual(revise['input_manifest']['review_upload'], REJECTED_FRAMES_MODE)
+        self.assertEqual(revise['input_manifest_sha256'], object_hash(revise['input_manifest']))
+        receipt = self.produce_review(revise, 2, unexpected_delta_frame=unexpected)
+        if unexpected:
+            with closing(sqlite3.connect(self.root / 'review.sqlite3')) as conn:
+                self.assertEqual(conn.execute('SELECT count(*) FROM execution_versions').fetchone()[0], 1)
+            return
+
+        item = next(item for item in receipt['artifacts'] if item['role'] == 'review_bundle')
+        assets = self.root / 'assets' / 'execution'
+        paths = {'pairs/0002.jpg'} if local else {'pairs/0002.jpg', 'white/0002.png'}
+        with ZipFile(assets / item['artifact_id']) as uploaded:
+            self.assertEqual(set(uploaded.namelist()), paths | {'index.json'})
+        self.assertEqual(self.post(self.reviewer, job + '/v/2/frames/2', action='approve', revision='0').status_code, 303)
+        self.register(key='downgrade', local=local)
+        self.heartbeat()
+        self.claim('old-worker', 204)
+        self.register(key='upgrade', local=local, incremental=True)
+        self.heartbeat()
+        final = self.claim('final')
+        self.assertNotIn('review_upload', final['input_manifest'])
+        final_inputs = self.artifacts(final)
+        approval = self.fetch(final, final_inputs['approval_manifest']).json
+        self.assertEqual([frame['approved_version'] for frame in approval['frames']], [1, 2])
+        if local:
+            self.assertNotIn('review_bundle', final_inputs)
+        else:
+            full = self.fetch(final, final_inputs['review_bundle']).data
+            self.assertEqual(sha(full), final_inputs['review_bundle']['sha256'])
+            with ZipFile(io.BytesIO(full)) as merged, ZipFile(assets / initial['review_bundle']['artifact_id']) as base:
+                index = json.loads(merged.read('index.json'))
+                self.assertNotIn('review_delta', index)
+                self.assertEqual(set(merged.namelist()), set(base.namelist()))
+                self.assertEqual(merged.read('pairs/0001.jpg'), base.read('pairs/0001.jpg'))
+                self.assertNotEqual(merged.read('pairs/0002.jpg'), base.read('pairs/0002.jpg'))
+
+    def test_central_delta_is_merged_for_review_and_followup(self):
+        self.check_delta_revision(local=False)
+
+    def test_local_delta_preserves_review_affinity(self):
+        self.check_delta_revision(local=True)
+
+    def test_delta_rejects_unmarked_frames(self):
+        self.check_delta_revision(local=False, unexpected=True)
 
     def test_video_queue_exclusive_claim_and_manual_return(self):
         self.setup_profile()
