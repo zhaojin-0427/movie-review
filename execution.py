@@ -1043,6 +1043,10 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                             CASE WHEN w.kind='finalize' THEN json_extract(w.manifest,'$.export_quality')
                                  ELSE e.export_quality END AS export_quality,
                             d.artifacts AS delivery_artifacts,
+                            w.state='stopped' AND w.kind='prepare' AND w.target=1 AND EXISTS(
+                                SELECT 1 FROM execution_management_events m WHERE m.job=w.job
+                                AND m.action='close_without_delivery' AND m.occurred_at=w.updated
+                            ) AS administratively_closed,
                             EXISTS(SELECT 1 FROM versions v WHERE v.job_id=w.job) AS review_exists
                             FROM execution_work w JOIN jobs j ON j.id=w.job LEFT JOIN execution_nodes n ON n.id=w.node
                             JOIN execution_jobs e ON e.job=w.job LEFT JOIN execution_nodes b ON b.id=e.review_node

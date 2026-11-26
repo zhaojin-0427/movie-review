@@ -210,21 +210,23 @@
     </div>{% endif %}
     {% for item in work %}
     {% set review_mode = local_review_mode if item.local_review else 'central' %}
-    {% set badge = 'approved' if item.state == 'succeeded' else ('review' if item.state == 'leased' else 'paused' if item.state in ('failed','paused','stopped','awaiting_manual') else 'waiting') %}
+    {% set display_state = 'succeeded' if item.administratively_closed else item.state %}
+    {% set status_label = '已完成 · 人工结案' if item.administratively_closed else states[display_state] %}
+    {% set badge = 'approved' if display_state == 'succeeded' else ('review' if item.state == 'leased' else 'paused' if item.state in ('failed','paused','stopped','awaiting_manual') else 'waiting') %}
     {% set subtitle = '#' ~ item.job ~ ' · ' ~ kinds[item.kind] ~ ' V' ~ item.target %}
-    <article class="execution-item execution-card" data-list-item data-search="{{ item.title }} #{{ item.job }}" data-status="{{ item.state }}" data-kind="{{ item.kind }}">
+    <article class="execution-item execution-card" data-list-item data-search="{{ item.title }} #{{ item.job }}" data-status="{{ display_state }}" data-kind="{{ item.kind }}">
       <div class="execution-card-name"><strong>{{ item.title }}</strong><small>{{ subtitle }}</small></div>
       <div class="execution-card-status">
-        <span class="badge {{ badge }}">{{ states[item.state] }}</span>
+        <span class="badge {{ badge }}">{{ status_label }}</span>
         <small>{{ review_modes[review_mode] }}{% if item.device and item.state in ('leased','awaiting_manual','verifying') %} · {{ item.device }}{% endif %}</small>
       </div>
       <button type="button" class="button small execution-card-open" data-open-execution-dialog="{{ item.id }}" aria-haspopup="dialog" aria-controls="{{ item.id }}" aria-label="查看工单详情 {{ subtitle }}">查看详情 <span aria-hidden="true">›</span></button>
       <dialog class="execution-dialog execution-work-details" id="{{ item.id }}" aria-labelledby="{{ item.id }}-title">
-        {{ detail_header(item.id, item.title, '工单 ' ~ subtitle, states[item.state], badge) }}
+        {{ detail_header(item.id, item.title, '工单 ' ~ subtitle, status_label, badge) }}
         {{ detail_tabs(item.id, '工单详情', [('overview','概览'),('history','领取记录（' ~ attempts[item.id]|length ~ '）'),('actions','工单操作')]) }}
         <section class="execution-dialog-body" role="tabpanel" id="{{ item.id }}-overview" aria-labelledby="{{ item.id }}-tab-overview" tabindex="0">
           <dl class="execution-facts">
-            <div><dt>当前阶段</dt><dd>{{ states[item.state] if item.state in ('awaiting_manual','verifying') else item.stage or ('等待设备领取' if item.state == 'queued' else states[item.state]) }}{% if item.total %} · {{ item.completed }}/{{ item.total }}{% endif %}</dd></div>
+            <div><dt>当前阶段</dt><dd>{{ status_label if item.administratively_closed or item.state in ('awaiting_manual','verifying') else item.stage or ('等待设备领取' if item.state == 'queued' else states[item.state]) }}{% if item.total %} · {{ item.completed }}/{{ item.total }}{% endif %}</dd></div>
             <div><dt>执行设备</dt><dd>{{ item.device or '—' }}</dd></div>
             <div><dt>成片画质</dt><dd>{{ {'4k':'4K','1080p':'1080p'}.get(item.export_quality, '原生画幅') }}</dd></div>
           </dl>
@@ -273,7 +275,7 @@
             <li>
               <div class="execution-claim-heading"><strong>第 {{ claim.attempt }} 次领取</strong>
                 {% if claim.returned_at is not none %}<span class="badge waiting">已退回</span>
-                {% elif claim.attempt == item.attempt and item.state != 'queued' %}<span class="badge {{ badge }}">{{ states[item.state] }}</span>{% endif %}
+                {% elif claim.attempt == item.attempt and item.state != 'queued' %}<span class="badge {{ badge }}">{{ status_label }}</span>{% endif %}
               </div>
               <div class="execution-claim-event"><span>领取</span><strong>{{ claim.device }}</strong>{% if claim.claimed_at is not none %}<time datetime="{{ stamp(claim.claimed_at) }}" data-local-time>{{ stamp(claim.claimed_at) }}</time>{% endif %}</div>
               {% if claim.returned_at is not none %}

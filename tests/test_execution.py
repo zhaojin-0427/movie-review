@@ -560,6 +560,21 @@ class ExecutionTest(unittest.TestCase):
         self.assertIn('设备环境', page)
         self.assertIn('工单操作', page)
 
+    def test_administratively_closed_first_work_is_displayed_completed_without_a_receipt(self):
+        self.setup_profile()
+        with closing(sqlite3.connect(self.root / 'review.sqlite3')) as conn, conn:
+            conn.execute("UPDATE execution_work SET state='stopped' WHERE job=1")
+            conn.execute("""INSERT INTO execution_management_events
+                SELECT w.job,e.actor,'close_without_delivery','人工结案',w.updated
+                FROM execution_work w JOIN execution_jobs e ON e.job=w.job WHERE w.job=1""")
+            self.assertIsNone(conn.execute('SELECT receipt FROM execution_work WHERE job=1').fetchone()[0])
+        page = self.admin.get('/admin/execution', base_url=BASE).text
+        self.assertIn('已完成 · 人工结案', page)
+        self.assertIn('data-search="模拟影片 #1" data-status="succeeded"', page)
+        self.register()
+        self.heartbeat()
+        self.claim('administratively-closed', 204)
+
     def test_admin_can_switch_review_mode_after_return_before_review(self):
         self.setup_profile()
         with closing(sqlite3.connect(self.root / 'review.sqlite3')) as conn:
