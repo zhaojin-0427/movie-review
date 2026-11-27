@@ -75,4 +75,4 @@ JPG 原样上传，每张最多 14 MiB。单个清单或元数据文件最多 16
 
 通过 HTTPS 打开「执行管理 → OSS 设置」，交付模式选择「逐图直传 / 成片整包」。 `video-public` 使用公共读，`video-gr` 使用私有并启用版本控制。OSS RAM 权限包括对应前缀的对象写入、分片操作、读取及根据版本读取，还需要用于连接测试的 `oss:GetBucketAcl` 和 `oss:GetBucketVersioning`。保留正式记录引用的对象版本，避免自动过期清理。
 
-浏览器直传的两个 Bucket 需要允许后台站点 Origin 发起 PUT，允许 `Content-Type` 和 `x-oss-meta-sha256` 请求头，审核 Bucket 需将 `x-oss-version-id` 列为允许暴露的响应头。后台通过现有 `oss-process --watch` 队列核验和登记，并可使用部署目录里的队列服务。逐图流程由 247 运行，无需另设云端 ZIP 处理服务。
+浏览器直传的两个 Bucket 需要允许后台站点 Origin 发起 PUT，允许 `Content-Type` 和 `x-oss-meta-sha256` 请求头，审核 Bucket 还需允许该站点 Origin 发起 GET，供审核页在后台预加载原图，并将 `x-oss-version-id` 列为允许暴露的响应头。后台通过现有 `oss-process --watch` 队列核验和登记，并可使用部署目录里的队列服务。逐图流程由 247 运行，无需另设云端 ZIP 处理服务。

@@ -188,11 +188,15 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
         return Location(**json.loads(row['location'])) if row else None
 
     def oss_bucket(location):
-        config = settings(db())
-        if config is None:
-            abort(503, '请配置 OSS 凭据')
-        builder = app.config.get('OSS_BUCKET_FACTORY', platform_bucket)
-        return builder(location, config, app.secret_key)
+        buckets = g.setdefault('oss_buckets', {})
+        key = (location.region, location.bucket)
+        if key not in buckets:
+            config = settings(db())
+            if config is None:
+                abort(503, '请配置 OSS 凭据')
+            builder = app.config.get('OSS_BUCKET_FACTORY', platform_bucket)
+            buckets[key] = builder(location, config, app.secret_key)
+        return buckets[key]
 
     def fetch_url(location):
         return oss_bucket(location).sign_url('GET', location.key, URL_SECONDS, slash_safe=True, params=location.params)

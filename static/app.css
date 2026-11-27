@@ -865,3 +865,33 @@ body:has(.execution-dialog[open]) { overflow: hidden; }
   .execution-action-layout > .execution-delete-form,
   .execution-action-layout:not(.has-control) > .execution-delete-form { grid-column: 1; justify-self: start; }
 }
+
+.review-preload {
+  display: grid;
+  gap: 5px;
+  padding: 8px 14px;
+  border-top: 1px solid #34445a;
+  background: #152235;
+  color: #dce9fc;
+  font-size: 12px;
+}
+.review-preload-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+.review-preload progress {
+  display: block;
+  width: 100%;
+  height: 5px;
+  border: 0;
+  border-radius: 10px;
+  overflow: hidden;
+  accent-color: #76a9ff;
+  background: #34445a;
+}
+.review-preload progress::-webkit-progress-bar { background: #34445a; }
+.review-preload progress::-webkit-progress-value { background: #76a9ff; }
+.review-preload progress::-moz-progress-bar { background: #76a9ff; }

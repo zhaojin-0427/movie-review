@@ -104,6 +104,15 @@ class ReviewTest(unittest.TestCase):
         self.begin(package(TIMING))
         detail = "/jobs/1/v/1/frame-data/2"
         headers = {"Accept": "application/json"}
+        image_sources = "/jobs/1/v/1/image-sources?start=2"
+        sources = self.user.get(image_sources)
+        self.assertEqual(sources.json["sources"],
+                         {str(n): f"/jobs/1/v/1/image/{n}" for n in (2, 3, 4)})
+        self.assertEqual(sources.headers["Cache-Control"], "private, no-store")
+        self.assertEqual(self.other.get(image_sources).status_code, 404)
+        self.assertEqual(self.app.test_client().get(image_sources).status_code, 303)
+        self.assertEqual(self.user.get("/jobs/1/v/1/image-sources?start=5").status_code, 404)
+        self.assertIn("img-src 'self' blob:", self.user.get("/jobs/1").headers["Content-Security-Policy"])
         response = self.user.get(detail, query_string={"revision": 0}, headers=headers)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json["frame"]["time_ms"], 33)

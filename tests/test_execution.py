@@ -473,6 +473,11 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual(self.post(self.reviewer,job+'/claim').status_code,303)
         prior = self.reviewer.get(job+'/v/1/image/1',base_url=BASE)
         self.assertIn('versionId='+declarations[frame_paths[0]]['version_id'],prior.location)
+        sources = self.reviewer.get(job+'/v/1/image-sources',base_url=BASE)
+        self.assertEqual(sources.json['sources']['1'],prior.location)
+        self.assertIn('versionId='+declarations[frame_paths[1]]['version_id'],sources.json['sources']['2'])
+        self.assertEqual(self.other.get(job+'/v/1/image-sources',base_url=BASE).status_code,404)
+
         self.assertEqual(self.other.get(job+'/v/1/image/1',base_url=BASE).status_code,404)
         self.assertEqual(self.post(self.reviewer,job+'/v/1/frames/1',action='approve',revision='0').status_code,303)
         self.assertEqual(self.post(self.reviewer,job+'/v/1/frames/2',action='save',revision='1',note='调整').status_code,303)

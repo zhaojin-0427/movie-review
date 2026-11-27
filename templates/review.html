@@ -1,7 +1,10 @@
 {% extends 'base.html' %}
 {% block title %}{{ job.title }} · 镜头审核{% endblock %}
 {% block main_class %}page review-page{% endblock %}
-{% block page_scripts %}<script src="{{ url_for('static', filename='review.js', v='frame-viewer-1') }}" defer></script>{% endblock %}
+{% block page_scripts %}
+<script src="{{ url_for('static', filename='review-preload.js', v=1) }}" defer></script>
+<script src="{{ url_for('static', filename='review.js', v='frame-viewer-2') }}" defer></script>
+{% endblock %}
 {% block content %}
 {% set job_state = job.control if job.control != 'active' else 'waiting' if job.owner_enabled == 0 and version.state == 'review' else 'pool' if job.owner_id is none else version.state %}
 <a class="back-link" href="{{ url_for('index') }}">← 审核队列</a>
@@ -31,6 +34,7 @@
      data-revision="{{ version.revision }}"
      data-frame-url="{{ url_for('frame_data',job_id=job.id,number=version.number,frame_no=0) }}"
      data-image-url="{{ url_for('image',job_id=job.id,number=version.number,frame_no=0) }}"
+     data-image-sources-url="{{ url_for('review_image_sources',job_id=job.id,number=version.number) }}"
      data-edit-url="{{ url_for('edit_frame',job_id=job.id,number=version.number,frame_no=0) }}"
      data-review-url="{{ url_for('review',job_id=job.id) }}">
   <script type="application/json" id="review-frame-states">{{ frames|map(attribute='state')|list|tojson }}</script>
@@ -57,6 +61,13 @@
     <div class="viewer-footer">
       <span class="mono" id="review-frame-time">{% if frame.time_ms is not none %}{{ '%0.3f'|format(frame.time_ms / 1000) }} s{% else %}第 {{ frame.number }} 帧{% endif %}</span>
       <span class="mono" id="review-frame-size">{{ frame.width }} × {{ frame.height }}</span>
+    </div>
+    <div class="review-preload" id="review-preload" hidden>
+      <div class="review-preload-summary">
+        <span id="review-preload-status" aria-live="polite"></span>
+        <button class="button small" id="review-preload-retry" type="button" hidden>继续加载</button>
+      </div>
+      <progress id="review-preload-progress" aria-label="整片图片加载进度" max="{{ version.frame_count }}" value="0"></progress>
     </div>
     <section class="timeline" aria-label="帧列表">
       <div class="timeline-head"><strong>帧列表</strong>

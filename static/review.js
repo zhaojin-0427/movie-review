@@ -52,6 +52,7 @@
   let groupStart = 0;
   let visible = [];
   const images = new Map();
+  const preload = window.createReviewImageCache(workspace, states.length);
 
   function pageUrl(number) {
     const url = new URL(workspace.dataset.reviewUrl, location.href);
@@ -142,6 +143,7 @@
 
   function requireRefresh(message, url = pageUrl(frameNumber)) {
     reloadRequired = true;
+    preload.stop();
     showError(message, () => location.assign(url), '刷新');
   }
 
@@ -157,19 +159,46 @@
     image.draggable = false;
     const entry = {image};
     images.set(number, entry);
-    image.src = urlFor('image', number);
-    entry.ready = image.decode().then(() => image).catch(error => {
+    entry.ready = preload.image(number).then(async blob => {
+      if (images.get(number) !== entry) return null;
+      if (blob) {
+        entry.objectUrl = URL.createObjectURL(blob);
+        image.src = entry.objectUrl;
+        try {
+          await image.decode();
+          return image;
+        } catch (error) {
+          releaseUrl(entry);
+          if (images.get(number) !== entry) throw error;
+          preload.discard(number);
+        }
+      }
+      image.src = urlFor('image', number);
+      await image.decode();
+      return image;
+    }).catch(error => {
       if (images.get(number) === entry) images.delete(number);
+      releaseUrl(entry);
       throw error;
     });
     return entry.ready;
+  }
+
+  function releaseUrl(entry) {
+    if (entry.objectUrl) {
+      URL.revokeObjectURL(entry.objectUrl);
+      entry.objectUrl = undefined;
+    }
   }
 
   function keepImages(numbers) {
     for (const [number, entry] of images) {
       if (numbers.includes(number)) continue;
       images.delete(number);
-      if (entry.image !== picture) entry.image.removeAttribute('src');
+      if (entry.image !== picture) {
+        entry.image.removeAttribute('src');
+        releaseUrl(entry);
+      }
     }
   }
 
@@ -182,6 +211,7 @@
   function warmNearby(number) {
     clearTimeout(warmTimer);
     const nearby = navigator.connection?.saveData ? [] : neighbours(number);
+    preload.warm(nearby);
     keepImages([number, ...nearby]);
     warmTimer = setTimeout(async () => {
       for (const candidate of nearby) {
@@ -647,6 +677,8 @@
   updateFields();
   renderStrip(true);
   updateControls();
+  loadingLabel.textContent = '正在加载当前帧…';
+  loadingLabel.hidden = false;
   const initial = picture;
   const initialFrame = frameNumber;
   const initialEntry = {image:initial};
@@ -654,12 +686,15 @@
   images.set(initialFrame,initialEntry);
   initialEntry.ready.then(() => {
     if (frameNumber !== initialFrame || switching) return;
+    loadingLabel.hidden = true;
     imageReady = true;
     updateControls();
     warmNearby(initialFrame);
   }).catch(() => {
     if (images.get(initialFrame) === initialEntry) images.delete(initialFrame);
     if (frameNumber === initialFrame && !switching) {
+      loadingLabel.hidden = true;
+      warmNearby(initialFrame);
       showError('当前帧图片加载失败。', () => showFrame(initialFrame,'replace'));
     }
   });

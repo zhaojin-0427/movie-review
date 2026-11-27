@@ -254,7 +254,8 @@ def create_app(config=None):
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
             "form-action 'self'; style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' https://*.aliyuncs.com; connect-src 'self' https://*.aliyuncs.com")
+            f"img-src 'self' {'blob: ' if request.endpoint == 'review' else ''}https://*.aliyuncs.com; "
+            "connect-src 'self' https://*.aliyuncs.com")
         if request.endpoint != "static":
             response.headers["Cache-Control"] = "private, no-store"
         return response
@@ -760,6 +761,26 @@ def create_app(config=None):
                        prior=dict(note=prior["note"], regions=json.loads(prior["regions"]),
                                   marked_url=url_for("marked_image", job_id=job_id, number=number-1, frame_no=frame_no))
                        if prior else None)
+
+    @app.get("/jobs/<int:job_id>/v/<int:number>/image-sources")
+    @requires()
+    def review_image_sources(job_id, number):
+        db().execute("BEGIN")
+        assigned_job(job_id)
+        version = version_row(job_id, number)
+        start = request.args.get("start", 1, type=int)
+        if not 1 <= start <= version["frame_count"]:
+            abort(404)
+        rows = db().execute("""SELECT f.number, o.location FROM frames f
+            LEFT JOIN oss_frames o ON o.version_id=f.version_id AND o.number=f.number
+            WHERE f.version_id=? AND f.number>=? ORDER BY f.number LIMIT 32""",
+                            (version["id"], start)).fetchall()
+        sources = {}
+        for row in rows:
+            sources[row["number"]] = (oss_fetch_url(Location(**json.loads(row["location"])))
+                                      if row["location"] else
+                                      url_for("image", job_id=job_id, number=number, frame_no=row["number"]))
+        return jsonify(sources=sources)
 
     @app.get("/jobs/<int:job_id>")
     @requires()
