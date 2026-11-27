@@ -318,6 +318,12 @@ class ExecutionTest(unittest.TestCase):
             self.assertIn('video-gr.',download.location)
 
     def test_oss_objects_uses_pinned_images_and_whole_delivery_without_cloud_processor(self):
+        self.check_oss_objects()
+
+    def test_oss_objects_accepts_all_revision_frames_and_reopens_changed_approval(self):
+        self.check_oss_objects(full_revision=True)
+
+    def check_oss_objects(self, *, full_revision=False):
         from types import SimpleNamespace
         from oss_objects import file_type
 
@@ -513,13 +519,36 @@ class ExecutionTest(unittest.TestCase):
             return self.finish_object_transfer(transfer,browser,raw=True)
 
         third_jpg = image('JPEG',(32,36),'blue')
-        revised = [frames[0], frames[1] | dict(review_signature=sha(third_jpg))]
-        revise_files = review_files(revise,{2:third_jpg},revised,self.artifacts(revise)['version_manifest']['sha256'])
-        self.assertEqual(reupload(revise_files | {frame_paths[0]:first_jpg})['state'],'rejected')
+        changed_jpg = image('JPEG',(32,36),'green')
+        base_sha = self.artifacts(revise)['version_manifest']['sha256']
+        revised = [frames[0] | dict(review_signature=sha(changed_jpg)), frames[1] | dict(review_signature=sha(third_jpg))]
+        if full_revision:
+            missing_required = reupload(review_files(revise,{1:changed_jpg},revised,base_sha))
+            self.assertEqual(missing_required['state'],'rejected')
+            self.assertIn('全部打回帧',missing_required['error'])
+            missing_changed = reupload(review_files(revise,{2:third_jpg},revised,base_sha))
+            self.assertEqual(missing_changed['state'],'rejected')
+            self.assertIn('变化的帧须上传',missing_changed['error'])
+            revise_files = review_files(revise,{1:changed_jpg,2:third_jpg},revised,base_sha)
+        else:
+            revised[0] = frames[0]
+            revise_files = review_files(revise,{2:third_jpg},revised,base_sha)
+            undeclared = reupload(revise_files | {frame_paths[0]:first_jpg})
+            self.assertEqual(undeclared['state'],'rejected')
+            self.assertIn('审核图清单',undeclared['error'])
         self.assertEqual(reupload(revise_files)['state'],'done')
-        self.assertEqual(self.reviewer.get(job+'/v/2/image/1',base_url=BASE).location,prior.location)
-        self.assertEqual(self.reviewer.get(job+'/v/2/frame-data/1?revision=0',base_url=BASE).json['frame']['state'],'approved')
-        self.assertEqual(self.post(self.reviewer,job+'/v/2/frames/2',action='approve',revision='0').status_code,303)
+        v2_image = self.reviewer.get(job+'/v/2/image/1',base_url=BASE).location
+        v2_state = self.reviewer.get(job+'/v/2/frame-data/1?revision=0',base_url=BASE).json['frame']['state']
+        if full_revision:
+            self.assertIn('/review/v0002/',v2_image)
+            self.assertEqual(v2_state,'pending')
+            self.assertEqual(self.post(self.reviewer,job+'/v/2/frames/1',action='approve',revision='0').status_code,303)
+        else:
+            self.assertEqual(v2_image,prior.location)
+            self.assertEqual(v2_state,'approved')
+        self.assertEqual(self.reviewer.get(job+'/v/1/image/1',base_url=BASE).location,prior.location)
+        self.assertEqual(self.post(self.reviewer,job+'/v/2/frames/2',action='approve',
+                                   revision=str(int(full_revision))).status_code,303)
         self.heartbeat()
         final = self.claim('objects-final')
         self.assertEqual(submit(final,'manual-delivery-ready')['state'],'awaiting_manual')
@@ -741,7 +770,7 @@ class ExecutionTest(unittest.TestCase):
         return response
 
     def produce_review(self,work,version,native_size=None,extra_white=False,check_retry_lock=False,
-                       unexpected_delta_frame=False,return_records=False):
+                       unexpected_delta_frame=False,return_records=False,full_delta=False):
         inputs = self.artifacts(work)
         frame_size = dict(width=32,height=18)
         timeline = to_json(dict(source_sha256=sha(self.source),time_base='1/1000',end_pts=80,
@@ -750,7 +779,7 @@ class ExecutionTest(unittest.TestCase):
         scene = zip_bytes({'scene.blend':self.scene},dict(scene_path='scene.blend',scene_sha256=sha(self.scene)))
         self.meta = b'{"description":"test"}\n'
         report = to_json(dict(frame_count=2))
-        colors = ['red','gray' if version == 1 else 'green']
+        colors = ['blue' if full_delta else 'red','gray' if version == 1 else 'green']
         frames = [dict(number=n,pts=(n-1)*40,review_signature=sha(color.encode()),pair_jpeg_path=f'pairs/{n:04d}.jpg',
                        white_png_path=f'white/{n:04d}.png') for n,color in enumerate(colors,1)]
         files = {path:image(fmt,size,color) for frame,color in zip(frames,colors) for path,fmt,size in (
@@ -765,13 +794,13 @@ class ExecutionTest(unittest.TestCase):
                 files = {name:data for name,data in files.items() if name.startswith('pairs/')}
         if work['input_manifest'].get('review_upload') == REJECTED_FRAMES_MODE:
             feedback = self.fetch(work, inputs['feedback_manifest']).json
-            rejected = [frame['number'] for frame in feedback['frames']]
+            submitted = [frame['number'] for frame in (frames if full_delta else feedback['frames'])]
             full_files = [dict(path=name, size_bytes=len(files[name]), sha256=sha(files[name])) for name in sorted(files)]
             common['review_delta'] = dict(mode=REJECTED_FRAMES_MODE, base_version=feedback['base_version'],
-                                          base_manifest_sha256=feedback['base_manifest_sha256'], frames=rejected,
+                                          base_manifest_sha256=feedback['base_manifest_sha256'], frames=submitted,
                                           full_files_sha256=object_hash(full_files))
             if not unexpected_delta_frame:
-                files = {name: data for name, data in files.items() if int(Path(name).stem) in rejected}
+                files = {name: data for name, data in files.items() if int(Path(name).stem) in submitted}
         review = zip_bytes(files,common|dict(target_version=version))
         manifest = to_json(common|dict(version=version,frame_count=2,scene_bundle_sha256=sha(scene),review_bundle_sha256=sha(review),
             shot_metadata_sha256=sha(self.meta),production_report_sha256=sha(report),input_manifest_sha256=work['input_manifest_sha256'],
@@ -1008,7 +1037,7 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual((status['job_state'],status['work_state'],status['delivery_versions']),('done','succeeded',[2]))
         self.assertEqual(self.post(self.reviewer,job+'/v/2/supplement',revision='2').status_code,303)
 
-    def check_delta_revision(self, local, unexpected=False):
+    def check_delta_revision(self, local, unexpected=False, full_delta=False):
         self.setup_profile(review_mode=LOCAL_REVIEW if local else 'central')
         self.register(local=local, incremental=True)
         self.heartbeat()
@@ -1026,7 +1055,7 @@ class ExecutionTest(unittest.TestCase):
         revise = self.claim('revise')
         self.assertEqual(revise['input_manifest']['review_upload'], REJECTED_FRAMES_MODE)
         self.assertEqual(revise['input_manifest_sha256'], object_hash(revise['input_manifest']))
-        receipt = self.produce_review(revise, 2, unexpected_delta_frame=unexpected)
+        receipt = self.produce_review(revise, 2, unexpected_delta_frame=unexpected, full_delta=full_delta)
         if unexpected:
             with closing(sqlite3.connect(self.root / 'review.sqlite3')) as conn:
                 self.assertEqual(conn.execute('SELECT count(*) FROM execution_versions').fetchone()[0], 1)
@@ -1035,9 +1064,16 @@ class ExecutionTest(unittest.TestCase):
         item = next(item for item in receipt['artifacts'] if item['role'] == 'review_bundle')
         assets = self.root / 'assets' / 'execution'
         paths = {'pairs/0002.jpg'} if local else {'pairs/0002.jpg', 'white/0002.png'}
+        if full_delta:
+            paths.update(name.replace('0002','0001') for name in tuple(paths))
         with ZipFile(assets / item['artifact_id']) as uploaded:
             self.assertEqual(set(uploaded.namelist()), paths | {'index.json'})
-        self.assertEqual(self.post(self.reviewer, job + '/v/2/frames/2', action='approve', revision='0').status_code, 303)
+        if full_delta:
+            v2 = self.reviewer.get(job + '/v/2/frame-data/1?revision=0',base_url=BASE).json
+            self.assertEqual(v2['frame']['state'],'pending')
+            self.assertEqual(self.post(self.reviewer, job + '/v/2/frames/1', action='approve', revision='0').status_code, 303)
+        self.assertEqual(self.post(self.reviewer, job + '/v/2/frames/2', action='approve',
+                                   revision=str(int(full_delta))).status_code, 303)
         self.register(key='downgrade', local=local)
         self.heartbeat()
         self.claim('old-worker', 204)
@@ -1047,7 +1083,7 @@ class ExecutionTest(unittest.TestCase):
         self.assertNotIn('review_upload', final['input_manifest'])
         final_inputs = self.artifacts(final)
         approval = self.fetch(final, final_inputs['approval_manifest']).json
-        self.assertEqual([frame['approved_version'] for frame in approval['frames']], [1, 2])
+        self.assertEqual([frame['approved_version'] for frame in approval['frames']], [2 if full_delta else 1, 2])
         if local:
             self.assertNotIn('review_bundle', final_inputs)
         else:
@@ -1057,7 +1093,8 @@ class ExecutionTest(unittest.TestCase):
                 index = json.loads(merged.read('index.json'))
                 self.assertNotIn('review_delta', index)
                 self.assertEqual(set(merged.namelist()), set(base.namelist()))
-                self.assertEqual(merged.read('pairs/0001.jpg'), base.read('pairs/0001.jpg'))
+                same = merged.read('pairs/0001.jpg') == base.read('pairs/0001.jpg')
+                self.assertEqual(same, not full_delta)
                 self.assertNotEqual(merged.read('pairs/0002.jpg'), base.read('pairs/0002.jpg'))
 
     def test_central_delta_is_merged_for_review_and_followup(self):
@@ -1066,8 +1103,11 @@ class ExecutionTest(unittest.TestCase):
     def test_local_delta_preserves_review_affinity(self):
         self.check_delta_revision(local=True)
 
-    def test_delta_rejects_unmarked_frames(self):
+    def test_delta_rejects_uploaded_files_missing_from_its_index(self):
         self.check_delta_revision(local=False, unexpected=True)
+
+    def test_delta_accepts_all_revision_frames(self):
+        self.check_delta_revision(local=False, full_delta=True)
 
     def test_video_queue_exclusive_claim_and_manual_return(self):
         self.setup_profile()

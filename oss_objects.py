@@ -140,25 +140,26 @@ def validate_review(bucket, work, order, inputs, objects, inspected, read_input,
     ticks = [frame['pts'] for frame in timeline['frames']]
     source, timing = read_timeline(dict(source_sha256=timeline['source_sha256'], pts=ticks,
                                         time_base=timeline['time_base'], end_pts=timeline['end_pts']), count)
+    uploaded = {int(PAIR.fullmatch(name)[1]) for name, (role, _, _) in inspected.items() if role is None}
     if first:
-        changed = set(range(1, count + 1))
+        require(uploaded == set(range(1, count + 1)), '首版须上传全部审核帧')
         require(index.get('base_manifest_sha256') is None, '首版不能引用返修基版')
         old_frames = {}
     else:
         feedback = read_input('feedback_manifest')
         base = read_input('version_manifest')
-        changed = {frame['number'] for frame in feedback['frames']}
-        require(changed and all(type(n) is int and 1 <= n <= count for n in changed)
+        required_frames = {frame['number'] for frame in feedback['frames']}
+        require(required_frames and all(type(n) is int and 1 <= n <= count for n in required_frames)
                 and index.get('base_manifest_sha256') == inputs['version_manifest']['sha256']
                 and len(base['frames']) == count
                 and all(base[key] == version[key] for key in ('review_size','final_size','timeline_sha256',
                                                               'source_sha256','review_storage','review_media')),
                 '返修基版、打回范围或画幅不一致')
+        require(required_frames <= uploaded and all(n <= count for n in uploaded),
+                '返修须上传全部打回帧，提交帧号须在时间线范围内')
         old_frames = {frame['number']:frame for frame in base['frames']}
-    names = {pair_name(n) for n in changed}
-    require(names == {name for name,(role,_,_) in inspected.items() if not role}, '仅可上传本轮要求的帧')
     expected_index = [dict(number=n, size_bytes=objects[pair_name(n)]['size_bytes'],
-                           sha256=objects[pair_name(n)]['sha256']) for n in sorted(changed)]
+                           sha256=objects[pair_name(n)]['sha256']) for n in sorted(uploaded)]
     require(index.get('frames') == expected_index, '审核图清单的帧号、大小或摘要不匹配')
 
     result, locations = [], {}
@@ -167,13 +168,13 @@ def validate_review(bucket, work, order, inputs, objects, inspected, read_input,
         require(type(frame['number']) is int and frame['number'] == n and frame['pts'] == tick
                 and frame['pair_jpeg_path'] == pair_name(n)
                 and isinstance(signature,str) and SHA.fullmatch(signature), '审核帧号、时序、路径或签名无效')
-        if n in changed:
+        if n in uploaded:
             name = pair_name(n)
             sha = objects[name]['sha256']
             content_signature = object_hash([n, *times[:2], width, 2*height, sha])
             ref = inspected[name][2].public()
         else:
-            require(frame == old_frames.get(n) and n in inherited, '打回范围外的帧必须沿用基版')
+            require(frame == old_frames.get(n) and n in inherited, '变化的帧须上传审核图，未提交的帧须与基版一致')
             content_signature, ref = inherited[n]
             require(ref.get('version_id'), '基版没有可继承的 OSS 对象版本')
         result.append(asdict(Frame(n, f'{n:06d}.jpg', 'image/jpeg', width, 2*height, content_signature, *times[2:])))

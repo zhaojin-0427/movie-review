@@ -117,25 +117,26 @@ def review_index_matches(index, version):
 
 def materialize_review_delta(path, base_path, destination, version, base, feedback, base_hash):
     delta = version['review_delta']
-    rejected = delta['frames']
-    require(isinstance(rejected, list) and rejected and all(type(n) is int for n in rejected)
-            and rejected == sorted({f['number'] for f in feedback['frames']})
+    submitted = delta['frames']
+    required_frames = {f['number'] for f in feedback['frames']}
+    require(isinstance(submitted, list) and required_frames and all(type(n) is int for n in submitted)
+            and submitted == sorted(set(submitted)) and required_frames <= set(submitted)
             and delta == dict(mode=REJECTED_FRAMES_MODE, base_version=base['version'], base_manifest_sha256=base_hash,
-                              frames=rejected, full_files_sha256=delta['full_files_sha256'])
+                              frames=submitted, full_files_sha256=delta['full_files_sha256'])
             and SHA.fullmatch(delta['full_files_sha256']), '增量帧或基版与冻结返修意见不匹配')
     frames, prior = version['frames'], base['frames']
-    require(len(frames) == len(prior) and all(1 <= n <= len(frames) for n in rejected)
+    require(len(frames) == len(prior) and all(1 <= n <= len(frames) for n in submitted)
             and all(version[key] == base[key] for key in ('job_id', 'source_sha256', 'timeline_sha256',
                                                          'review_size', 'final_size'))
             and version.get('review_storage') == base.get('review_storage'), '增量审核包的基版或画幅不匹配')
-    rejected = set(rejected)
+    submitted = set(submitted)
     roles = ('pair_jpeg_path',) if version.get('review_storage') else ('pair_jpeg_path', 'white_png_path')
     changed, inherited = set(), set()
     for number, (frame, previous) in enumerate(zip(frames, prior, strict=True), 1):
-        if number in rejected:
+        if number in submitted:
             changed.update(frame[role] for role in roles)
         else:
-            require(frame == previous, '增量审核包改动了打回范围外的帧')
+            require(frame == previous, '变化的帧须包含在增量审核包中，未提交的帧须与基版一致')
             inherited.update(frame[role] for role in roles)
 
     def merge(archive, files, index):

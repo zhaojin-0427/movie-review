@@ -10,13 +10,13 @@ video-gr/movie-review/jobs/{job_id}/review/v{version}/{work_id}/a{attempt}/{uplo
 video-gr/movie-review/jobs/{job_id}/delivery/from-v{version}/{work_id}/a{attempt}/{upload_id}/
 ```
 
-版号、领取次数最少四位，例如 `v0002/a0001`。所有目录由服务端分配。审核目录中 `pairs/000001.jpg` 等文件名用六位帧号。正式记录保存具体的 OSS 对象版本。返修版中未打回的帧指向基版已有的对象版本。
+版号、领取次数最少四位，例如 `v0002/a0001`。所有目录由服务端分配。审核目录中 `pairs/000001.jpg` 等文件名用六位帧号。正式记录保存具体的 OSS 对象版本。返修版中未重新提交的帧指向基版已有的对象版本。
 
 ## 注册与领取
 
 - 设备注册在 `capabilities` 中增加 `"oss_objects": true`，用新幂等键注册，并继续发送 `X-Film-Worker-Review-Storage: node_local_v1`。兼容旧 OSS ZIP 流程的设备可另外保留 `oss_delivery: true`。旧增量 ZIP 使用的 `X-Film-Worker-Review-Upload` 与本协议独立。
 - 领取响应的 `oss.protocol` 为 `objects_v1` 时走本协议。 `oss.source_url` 为 HTTPS 原片下载链接，下载后核对原片大小和 SHA-256。链接过期时重新访问原有工件下载 API，请求 247 返回最新地址。跟随 302 时，设备 Token 和租约头只发给 247。
-- `oss.delivery` 是本次领取的交付方式，`auto` 为自动，`manual` 为手动。首版 `oss.review_scope` 是 `all_frames`，返修是 `rejected_frames`，出片为 `null`。返修范围从 `feedback_manifest.frames` 读取。
+- `oss.delivery` 是本次领取的交付方式，`auto` 为自动，`manual` 为手动。首版 `oss.review_scope` 是 `all_frames`，返修继续返回 `rejected_frames` 以兼容已有执行端，出片为 `null`。返修必须上传 `feedback_manifest.frames` 中的打回帧，也可上传其他受影响的帧或全帧。
 - 同机审片继续保留本地工程和白模素材。生成、上传期间照常续租。
 
 ## 自动交付
@@ -28,7 +28,7 @@ video-gr/movie-review/jobs/{job_id}/delivery/from-v{version}/{work_id}/a{attempt
 
 | 文件 | Content-Type | 使用阶段 |
 |---|---|---|
-| `pairs/000001.jpg` 等 | `image/jpeg` | 首版全帧，返修仅打回帧 |
+| `pairs/000001.jpg` 等 | `image/jpeg` | 首版全帧，返修至少包含打回帧 |
 | `review-index.json`、`version.json`、`production.json` | `application/json` | 首版、返修 |
 | `meta.jsonl` | `application/x-ndjson` | 首版、返修 |
 | `timeline.json` | `application/json` | 首版 |
@@ -39,7 +39,7 @@ JPG 原样上传，每张最多 14 MiB。单个清单或元数据文件最多 16
 
 ## 审片清单
 
-`review-index.json` 示例。首版的 `base_manifest_sha256` 为 `null`。返修填领单中基版 `version_manifest` 的 SHA-256。
+`review-index.json` 示例。`frames` 按帧号列出本次实际上传的所有 JPG，须与提交的 OSS 对象逐项对应。首版的 `base_manifest_sha256` 为 `null`。返修填领单中基版 `version_manifest` 的 SHA-256。
 
 ```json
 {
@@ -61,7 +61,7 @@ JPG 原样上传，每张最多 14 MiB。单个清单或元数据文件最多 16
 
 - `review_index_sha256`、`shot_metadata_sha256`、`production_report_sha256`，分别绑定三个已上传文件。
 - `production_method: "codex_trial"`、`scene_sha256`、`review_size`、`final_size` 和 `frame_count`。尺寸形如 `{"width":1920,"height":1080}`，`review_size` 是单幅尺寸，对比 JPG 上下拼接。
-- 完整的 `frames` 列表，按帧号排序。每项含 `number`、`pts`、`review_signature` 和 `pair_jpeg_path`。 `pair_jpeg_path` 使用六位帧号。保持打回范围外的帧记录与基版逐字段一致。 `review_signature` 继续使用现有的逐帧签名算法。
+- 完整的 `frames` 列表，按帧号排序。每项含 `number`、`pts`、`review_signature` 和 `pair_jpeg_path`。`pair_jpeg_path` 使用六位帧号。未上传的帧记录须与基版逐字段一致。`review_signature` 继续使用现有的逐帧签名算法。发生变化的已通过帧回到待审。
 - 首版 `timeline.json` 沿用现有执行端时间线协议。返修沿用基版时间线。
 
 ## 手动交付
