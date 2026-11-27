@@ -198,8 +198,12 @@
 <div class="execution-grid execution-section" id="queue" data-execution-section>
   <section class="panel execution-list execution-card-list" aria-labelledby="queue-title" data-filter-list>
     <header class="section-heading section-heading-panel">
-      <div><h2 id="queue-title">工单</h2><p>空闲设备自动领单。已领取的工单由管理员退回后重新排队。</p></div>
-      <span class="total">最近 <span data-match-count>{{ work|length }}</span> 张</span>
+      <div>
+        <h2 id="queue-title">工单{% if upload_job %} #{{ upload_job }}{% endif %}</h2>
+        {% if upload_job %}<a class="text-button" href="{{ url_for('execution.panel', _anchor='queue') }}">查看全部工单</a>
+        {% else %}<p>空闲设备自动领单。已领取的工单由管理员退回后重新排队。</p>{% endif %}
+      </div>
+      <span class="total">{{ '共' if upload_job else '最近' }} <span data-match-count>{{ work|length }}</span> 张</span>
     </header>
     {% set states = {'queued':'待领取','leased':'执行中','succeeded':'已完成','paused':'已暂停','stopped':'已停止','failed':'待处理','awaiting_manual':'待手动交付','verifying':'校验中'} %}
     {% if work %}<div class="list-filters" hidden>
@@ -309,7 +313,7 @@
         {{ detail_footer() }}
       </dialog>
     </article>
-{% else %}<p class="execution-empty">暂无制作工单。上传原片后，系统会生成首版工单。</p>{% endfor %}
+{% else %}<p class="execution-empty">{{ '此作业没有可显示的工单。' if upload_job else '暂无制作工单。上传原片后，系统会生成首版工单。' }}</p>{% endfor %}
     <p class="execution-empty" data-no-matches hidden>没有符合条件的工单。</p>
   </section>
   <section class="panel form-panel execution-create-panel" aria-labelledby="job-create-title">
@@ -332,6 +336,7 @@
         <option value="4k">4K</option>
       </select><small class="field-help">4K 需要审核版原生宽度为 3840，否则出片时使用 1080p。</small></label>
       <p class="field-help" data-upload-status aria-live="polite">可一次选择多个视频，每个视频会分别创建一条工单。</p>
+      <div data-upload-results hidden></div>
       <button class="button primary" type="submit">上传并排队</button>
     </form>
   </section>

@@ -52,6 +52,7 @@ if (batchUploadForm) {
   const dropzone = batchUploadForm.querySelector('[data-upload-dropzone]');
   const fileList = batchUploadForm.querySelector('[data-upload-files]');
   const uploadStatus = batchUploadForm.querySelector('[data-upload-status]');
+  const uploadResults = batchUploadForm.querySelector('[data-upload-results]');
   const submitButton = batchUploadForm.querySelector('button[type="submit"]');
   let selectedFiles = [];
   let dragDepth = 0;
@@ -84,6 +85,7 @@ if (batchUploadForm) {
       : '可一次选择多个视频，每个视频会分别创建一条工单。';
   };
   const addFiles = (files) => {
+    if (submitButton.disabled) return;
     const known = new Set(selectedFiles.map(fileKey));
     for (const file of Array.from(files || [])) {
       if (!known.has(fileKey(file))) {
@@ -136,24 +138,34 @@ if (batchUploadForm) {
       event.preventDefault();
       if (submitButton.disabled) return;
       submitButton.disabled = true;
-      const results = [];
-      const failed = [];
+      uploadResults.replaceChildren();
+      uploadResults.hidden = true;
+      const failedFiles = [];
       try {
         for (const file of selectedFiles) {
+          const row = document.createElement('div');
+          row.className = 'notice';
           try {
             const result = await window.movieReviewOssUpload(batchUploadForm, file, null,
               message => { uploadStatus.textContent = message; });
-            results.push(`#${result.job}${result.reused ? '（已存在）' : ''}`);
+            const link = document.createElement('a');
+            link.href = `?job=${encodeURIComponent(result.job)}#queue`;
+            link.className = 'button small';
+            link.textContent = `查看工单 #${result.job}`;
+            row.append(`${file.name} · ${result.reused ? '原片已存在' : '已创建工单'} · `, link);
           } catch (error) {
-            failed.push(`${file.name}：${error.message}`);
+            failedFiles.push(file);
+            row.classList.add('error');
+            row.textContent = `${file.name}：${error.message}`;
           }
+          uploadResults.append(row);
         }
-        if (!failed.length) {
-          location.hash = 'queue';
-          location.reload();
-          return;
-        }
-        uploadStatus.textContent = [...results, ...failed].join(' · ');
+        selectedFiles = failedFiles;
+        sourceInput.value = '';
+        syncInput();
+        updateFileList();
+        uploadResults.hidden = false;
+        uploadStatus.textContent = failedFiles.length ? '上传结束，可重试失败的文件。' : '上传结束，请查看下方工单。';
       } finally {
         submitButton.disabled = false;
       }

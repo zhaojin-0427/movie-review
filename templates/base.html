@@ -6,7 +6,7 @@
   <title>{% block title %}镜头审核{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='app.css', v='frame-viewer-2') }}">
   {% block page_scripts %}{% endblock %}
-  <script src="{{ url_for('static', filename='app.js', v='oss-workflow-1') }}" defer></script>
+  <script src="{{ url_for('static', filename='app.js', v='oss-workflow-2') }}" defer></script>
 </head>
 <body data-user-id="{{ g.user.id if g.user else '' }}" data-identity-url="{{ url_for('identity') }}">
 {% if g.user %}

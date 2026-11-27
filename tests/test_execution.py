@@ -390,12 +390,16 @@ class ExecutionTest(unittest.TestCase):
         with patch('oss2.PartIterator',partials):
             origin = multipart(self.post(self.admin,browser,filename='原片.mp4',size_bytes=len(content),
                                         sha256=sha(content)),content)
+            repeated = multipart(self.post(self.admin,browser,filename='改名重传.mp4',size_bytes=len(content),
+                                          sha256=sha(content)),content)
+        self.assertEqual(repeated, dict(job=origin['job'], reused=True))
         job_id = str(origin['job'])
         job = '/jobs/'+job_id
         self.assertEqual(reads,[])
         page = self.admin.get('/admin/execution',base_url=BASE).text
         self.assertIn('data-oss-protocol="objects_v1"',page)
         self.assertIn('vendor/zip-native.min.js',page)
+        self.assertIn('data-upload-results',page)
         self.register(local=True)
         self.heartbeat()
         self.claim('old-objects-capability',204)
@@ -667,6 +671,12 @@ class ExecutionTest(unittest.TestCase):
             rows = conn.execute("""SELECT j.title FROM execution_jobs e JOIN jobs j ON j.id=e.job
                                    ORDER BY j.id""").fetchall()
         self.assertEqual([row[0] for row in rows], ['模拟影片', '批量一', '批量二'])
+        focused = self.admin.get('/admin/execution?job=2',base_url=BASE)
+        self.assertEqual(focused.status_code,200)
+        self.assertIn('data-search="批量一 #2"',focused.text)
+        self.assertNotIn('data-search="批量二 #3"',focused.text)
+        self.assertIn('href="/admin/execution#queue"',focused.text)
+        self.assertEqual(self.reviewer.get('/admin/execution?job=2',base_url=BASE).status_code,403)
 
         response = batch([(b'batch-two', '再次上传.mov')])
         self.assertEqual(response.status_code, 303, response.text)

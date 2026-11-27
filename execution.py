@@ -1014,7 +1014,7 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                 status['receipt'] = json.loads(work['receipt'])
             return jsonify(status)
 
-    def manage_page(secret=None, issued_node=None):
+    def manage_page(secret=None, issued_node=None, *, upload_job=None):
         with write() as conn:
             expire_leases(conn)
         conn = db()
@@ -1057,8 +1057,9 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                             LEFT JOIN job_controls c ON c.job_id=w.job
                             LEFT JOIN execution_oss_batches bat ON bat.work=w.id AND bat.attempt=w.attempt
                             LEFT JOIN execution_deliveries d ON d.job=w.job AND d.version=w.target AND w.kind='finalize'
-                            WHERE w.deleted_at IS NULL AND w.state!='deleted'
-                            ORDER BY w.rowid DESC LIMIT 100''',(now()-ONLINE_SECONDS,LOCAL_REVIEW)).fetchall()
+                            WHERE w.deleted_at IS NULL AND w.state!='deleted' AND (? IS NULL OR w.job=?)
+                            ORDER BY w.rowid DESC LIMIT 100''',
+                            (now()-ONLINE_SECONDS,LOCAL_REVIEW,upload_job,upload_job)).fetchall()
         work = [dict(row, delivery_roles=json.loads(row['delivery_artifacts']) if row['delivery_artifacts'] else {})
                 for row in work]
         attempts = {row['id']: [] for row in work}
@@ -1074,6 +1075,7 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
                 running[row['node']].append(row)
         return render_template('execution.html', nodes=nodes, tokens=history, work=work, attempts=attempts,
                                running=running, kinds=KINDS, secret=secret, issued_node=issued_node, stamp=stamp,
+                               upload_job=upload_job,
                                review_modes=REVIEW_MODES, local_review_mode=LOCAL_REVIEW, review_mode_editable=review_mode_editable,
                                register_request=secrets.token_hex(16), issue_request=secrets.token_hex(16),
                                oss_enabled=bool(request.is_secure and settings(conn)),
@@ -1393,7 +1395,10 @@ def setup_execution(app, data, db, write, requires, assert_session, import_versi
     @admin.get('/admin/execution')
     @requires('admin')
     def panel():
-        return manage_page()
+        job = request.args.get('job', type=int)
+        if job is not None and not 1 <= job < 2**63:
+            abort(404)
+        return manage_page(upload_job=job)
 
     def issue(conn,node,days):
         token = 'fw_' + secrets.token_urlsafe(32)
